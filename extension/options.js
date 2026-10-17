@@ -7,6 +7,9 @@ const currentVersion = chrome.runtime.getManifest().version;
 
 document.getElementById('current-version').textContent = currentVersion;
 
+// Same cleanup as in background.js, in case the worker hasn't run onInstalled yet.
+chrome.storage.local.remove(['csvData', 'savedMatches', 'appliedBids', 'catalogUrls', 'invalidThreshold']);
+
 chrome.storage.local.get(['urlPatterns', 'githubRepo'], (r) => {
   document.getElementById('url-patterns').value = (r.urlPatterns || []).join('\n');
   repoInput.value = r.githubRepo || '';
