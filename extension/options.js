@@ -1,18 +1,17 @@
 'use strict';
 
 const statusEl = document.getElementById('status');
-const repoInput = document.getElementById('github-repo');
+const GITHUB_REPO = 'heroboec/posmaext';
 const resultEl = document.getElementById('update-result');
 const currentVersion = chrome.runtime.getManifest().version;
 
 document.getElementById('current-version').textContent = currentVersion;
 
 // Same cleanup as in background.js, in case the worker hasn't run onInstalled yet.
-chrome.storage.local.remove(['csvData', 'savedMatches', 'appliedBids', 'catalogUrls', 'invalidThreshold']);
+chrome.storage.local.remove(['csvData', 'savedMatches', 'appliedBids', 'catalogUrls', 'invalidThreshold', 'githubRepo']);
 
-chrome.storage.local.get(['urlPatterns', 'githubRepo'], (r) => {
+chrome.storage.local.get(['urlPatterns'], (r) => {
   document.getElementById('url-patterns').value = (r.urlPatterns || []).join('\n');
-  repoInput.value = r.githubRepo || '';
 });
 
 function setStatus(msg, ok) {
@@ -24,7 +23,7 @@ document.getElementById('save-btn').addEventListener('click', () => {
   const patterns = document.getElementById('url-patterns').value
     .split('\n').map(l => l.trim()).filter(Boolean);
 
-  chrome.storage.local.set({ urlPatterns: patterns, githubRepo: normalizeRepo(repoInput.value) }, () => {
+  chrome.storage.local.set({ urlPatterns: patterns }, () => {
     if (chrome.runtime.lastError) {
       setStatus(`Ошибка хранилища: ${chrome.runtime.lastError.message}`, false);
       return;
@@ -34,14 +33,6 @@ document.getElementById('save-btn').addEventListener('click', () => {
 });
 
 // ── Updates ───────────────────────────────────────────────────────────────────
-
-// Accepts "owner/repo", "https://github.com/owner/repo(.git)(/...)".
-function normalizeRepo(value) {
-  const m = (value || '').trim()
-    .replace(/^(https?:\/\/)?(www\.)?github\.com\//i, '')
-    .match(/^([\w.-]+)\/([\w.-]+?)(?:\.git)?(?:[/?#].*)?$/);
-  return m ? `${m[1]}/${m[2]}` : '';
-}
 
 // "2.10" > "2.9"; missing parts count as 0.
 function compareVersions(a, b) {
@@ -70,15 +61,10 @@ function showResult(text, color, link) {
 }
 
 async function checkUpdates() {
-  const repo = normalizeRepo(repoInput.value);
-  if (!repo) { showResult('Укажите репозиторий в виде владелец/репозиторий', '#c0392b'); return; }
-  repoInput.value = repo;
-  chrome.storage.local.set({ githubRepo: repo });
-
   showResult('Проверяю…', '#555');
   let resp;
   try {
-    resp = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+    resp = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`, {
       headers: { Accept: 'application/vnd.github+json' },
       cache: 'no-store',
     });
