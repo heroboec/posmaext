@@ -203,8 +203,14 @@ pmInitMacroValuesPage();
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
+function pmIsMacroValuesPage() {
+  return location.pathname.includes('/macro-values/') ||
+    !!document.getElementById('bid-macro-values-edit-form');
+}
+
 function pmStart() {
-  if (pmObserver || !pmUrlMatches()) return;
+  // The macro-values page has its own behaviour (field sorting + floating save), no filter panel.
+  if (pmObserver || !pmUrlMatches() || pmIsMacroValuesPage()) return;
   pmUpdateFilterPanel();
 
   let timer = null;

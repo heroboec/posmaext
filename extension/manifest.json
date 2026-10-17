@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Position Matcher",
-  "version": "2.5",
+  "version": "2.6",
   "description": "Category filter for the bids table",
   "permissions": [
     "storage"
