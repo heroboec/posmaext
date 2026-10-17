@@ -242,11 +242,112 @@ function pmAddFloatingSave(form) {
   document.body.appendChild(btn);
 }
 
+// ── Decline bid from the macro-values page ───────────────────────────────────
+
+const PM_DECLINED_STATUS = '4';
+
+function pmGetCsrf() {
+  return document.querySelector('meta[name="csrf-token"]')?.content || null;
+}
+
+function pmBidIdFromForm(form) {
+  const m = (form.getAttribute('action') || location.pathname).match(/\/(\d+)\/?$/);
+  return m ? m[1] : null;
+}
+
+// Same request the bids list sends when status is switched to "отклонено".
+async function pmDeclineBid(bidId, message) {
+  const csrf = pmGetCsrf();
+  if (!csrf) throw new Error('не найден CSRF-токен на странице');
+  const body = new URLSearchParams({ act: 'bids', do: 'change_status', bid_id: bidId, status: PM_DECLINED_STATUS, message });
+  const resp = await fetch(location.origin + '/req/bids.php', {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'x-csrf-token': csrf,
+      'x-requested-with': 'XMLHttpRequest',
+    },
+    body,
+  });
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (_) {}
+  if (!resp.ok) throw new Error(`сервер ответил ${resp.status}`);
+  if (json && (json.status === 'error' || json.error)) throw new Error(json.message || json.error || 'ошибка сервера');
+  return json;
+}
+
+function pmShowDeclineDialog(bidId, onDone) {
+  if (document.querySelector('.pm-modal-backdrop')) return;
+  const backdrop = document.createElement('div');
+  backdrop.className = 'pm-modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="pm-modal" role="dialog" aria-modal="true">
+      <div class="pm-modal-title"></div>
+      <textarea class="pm-modal-reason" rows="5" placeholder="Причина отклонения (увидит партнёр)"></textarea>
+      <div class="pm-modal-error"></div>
+      <div class="pm-modal-actions">
+        <button type="button" class="pm-modal-cancel">Отмена</button>
+        <button type="button" class="pm-modal-submit">Отклонить</button>
+      </div>
+    </div>`;
+  backdrop.querySelector('.pm-modal-title').textContent = `Отклонить заявку #${bidId}`;
+  const reason = backdrop.querySelector('.pm-modal-reason');
+  const errorEl = backdrop.querySelector('.pm-modal-error');
+  const submit = backdrop.querySelector('.pm-modal-submit');
+  const cancel = backdrop.querySelector('.pm-modal-cancel');
+  const close = () => backdrop.remove();
+
+  const doSubmit = async () => {
+    const message = reason.value.trim();
+    if (!message) { errorEl.textContent = 'Укажите причину'; reason.focus(); return; }
+    errorEl.textContent = '';
+    submit.disabled = cancel.disabled = reason.disabled = true;
+    submit.textContent = 'Отправляю…';
+    try {
+      await pmDeclineBid(bidId, message);
+      close();
+      onDone();
+    } catch (e) {
+      errorEl.textContent = `✗ Не удалось: ${e.message}`;
+      submit.disabled = cancel.disabled = reason.disabled = false;
+      submit.textContent = 'Отклонить';
+    }
+  };
+
+  submit.onclick = doSubmit;
+  cancel.onclick = close;
+  backdrop.addEventListener('mousedown', e => { if (e.target === backdrop && !cancel.disabled) close(); });
+  reason.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !cancel.disabled) close();
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doSubmit();
+  });
+  document.body.appendChild(backdrop);
+  reason.focus();
+}
+
+function pmAddDeclineButton(form) {
+  const bidId = pmBidIdFromForm(form);
+  if (!bidId || document.querySelector('.pm-float-decline')) return;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'pm-float-decline';
+  btn.textContent = '✗ Отклонить';
+  btn.title = `Перевести заявку #${bidId} в статус «отклонено»`;
+  btn.onclick = () => pmShowDeclineDialog(bidId, () => {
+    btn.textContent = `✗ Заявка #${bidId} отклонена`;
+    btn.disabled = true;
+  });
+  document.body.appendChild(btn);
+}
+
 function pmInitMacroValuesPage() {
   const form = document.getElementById('bid-macro-values-edit-form');
   if (!form) return;
   pmSortMacroFields(form);
   pmAddFloatingSave(form);
+  pmAddDeclineButton(form);
 }
 
 pmInitMacroValuesPage();
