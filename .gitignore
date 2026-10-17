@@ -1,0 +1,7 @@
+# Source archive with catalog data / documents — never publish
+*.zip
+*.csv
+*.pdf
+
+# IDE
+.idea/

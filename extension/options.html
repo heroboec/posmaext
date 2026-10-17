@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Position Matcher — Настройки</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 520px; margin: 32px auto; padding: 0 20px; font-size: 14px; color: #222; }
+    h2 { margin: 0 0 24px; font-size: 20px; }
+    label { display: block; font-weight: 600; margin: 18px 0 5px; }
+    textarea { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; resize: vertical; height: 80px; }
+    .hint { color: #888; font-size: 12px; margin-top: 4px; }
+    .row { display: flex; gap: 10px; margin-top: 22px; align-items: center; }
+    button.primary { padding: 8px 22px; background: #4a90d9; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 500; }
+    button.primary:hover { background: #357abd; }
+    #status { font-size: 13px; }
+    .ok { color: #2a7a2a; }
+    .err { color: #c0392b; }
+    .section { border: 1px solid #e8e8e8; border-radius: 6px; padding: 14px 16px; margin-bottom: 20px; }
+    .section-title { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
+    input[type=text] { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+    button.secondary { padding: 7px 16px; background: #f5f5f5; color: #333; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    button.secondary:hover { background: #e8e8e8; }
+    #update-result { font-size: 13px; margin-top: 10px; min-height: 18px; }
+    #update-result a { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h2>Position Matcher — Настройки</h2>
+
+  <div class="section">
+    <div class="section-title">URL-паттерны</div>
+    <div class="hint">Панель фильтров появится только на страницах, URL которых содержит хотя бы один паттерн. По одному на строку.</div>
+    <label>Паттерны</label>
+    <textarea id="url-patterns" placeholder="например:&#10;github.com/admin&#10;mysite.com/bids"></textarea>
+  </div>
+
+  <div class="row">
+    <button class="primary" id="save-btn">Сохранить</button>
+    <span id="status"></span>
+  </div>
+
+  <div class="section" style="margin-top: 28px">
+    <div class="section-title">Обновления</div>
+    <div class="hint">Текущая версия: <b id="current-version">—</b>. Новая версия берётся из последнего релиза публичного GitHub-репозитория.</div>
+    <label>Репозиторий GitHub</label>
+    <input type="text" id="github-repo" placeholder="владелец/репозиторий или ссылка на него">
+    <div class="row" style="margin-top: 12px">
+      <button class="secondary" id="check-btn">Проверить обновления</button>
+      <button class="secondary" id="reload-btn">Перезагрузить расширение</button>
+    </div>
+    <div id="update-result"></div>
+    <div class="hint" style="margin-top: 10px">
+      Как обновить: скачайте zip → распакуйте с заменой файлов в папку, откуда установлено расширение → нажмите «Перезагрузить расширение» → обновите вкладки админки.
+    </div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
