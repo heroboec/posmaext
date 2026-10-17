@@ -55,37 +55,79 @@ function pmToggleAllDetails() {
   if (btn) btn.textContent = pmAllExpanded ? '▲ Свернуть' : '▼ Раскрыть';
 }
 
-// ── Open "Править значения заявки" links ──────────────────────────────────────
+// ── Batch actions: open "Править значения заявки" / set status "в продаже" ───
+// Both work on the same batch: the first PM_BATCH_LIMIT visible bids, top to bottom.
 
-const PM_OPEN_DELAY = 700;
-let   pmOpenProgress = null; // null = idle, otherwise "i/total"
+const PM_BATCH_LIMIT   = 10;
+const PM_BATCH_DELAY   = 800;
+const PM_REVIEW_STATUS = new Set(['2', '6', '7']); // на проверке / 48ч / 72ч
+const PM_SALE_STATUS   = '3';                       // аккаунты в продаже
+let   pmBusy = null; // null = idle, otherwise { kind: 'open' | 'sale', progress: 'i/total' }
 
-function pmGetMacroLinks() {
-  const urls = [];
-  document.querySelectorAll('tr.tr_default.bids-tr-table-new:not(.pm-hidden-by-filter)').forEach(tr => {
-    const a = tr.querySelector('a.bid-macro-values-edit-outside-link');
-    if (a?.href) urls.push(a.href);
-  });
-  return urls;
+function pmGetBatch() {
+  const batch = [];
+  for (const tr of document.querySelectorAll('tr.tr_default.bids-tr-table-new:not(.pm-hidden-by-filter)')) {
+    const bidId = tr.querySelector('a[data-bid-id-show-section]')?.getAttribute('data-bid-id-show-section');
+    if (!bidId) continue;
+    batch.push({
+      bidId,
+      link:   tr.querySelector('a.bid-macro-values-edit-outside-link')?.href || null,
+      select: tr.querySelector(`#status_id${bidId}`) || tr.querySelector('select[name="status"]'),
+    });
+    if (batch.length >= PM_BATCH_LIMIT) break;
+  }
+  return batch;
+}
+
+function pmSaleCandidates(batch) {
+  return batch.filter(b => b.select && PM_REVIEW_STATUS.has(b.select.value));
 }
 
 function pmOpenBtnText() {
-  return pmOpenProgress ? `… ${pmOpenProgress}` : `↗ Править значения (${pmGetMacroLinks().length})`;
+  if (pmBusy?.kind === 'open') return `… ${pmBusy.progress}`;
+  return `↗ Править значения (${pmGetBatch().filter(b => b.link).length})`;
 }
 
-async function pmOpenMacroLinks() {
-  if (pmOpenProgress) return;
-  const urls = pmGetMacroLinks();
-  if (!urls.length) return;
-  for (let i = 0; i < urls.length; i++) {
-    pmOpenProgress = `${i + 1}/${urls.length}`;
-    const btn = document.querySelector('.pm-filter-open-btn');
-    if (btn) btn.textContent = pmOpenBtnText();
-    chrome.runtime.sendMessage({ action: 'open-tab', url: urls[i] });
-    if (i < urls.length - 1) await new Promise(r => setTimeout(r, PM_OPEN_DELAY));
+function pmSaleBtnText() {
+  if (pmBusy?.kind === 'sale') return `… ${pmBusy.progress}`;
+  return `🛒 В продаже (${pmSaleCandidates(pmGetBatch()).length})`;
+}
+
+function pmSetBusy(kind, i, total) {
+  pmBusy = { kind, progress: `${i}/${total}` };
+  const btn = document.querySelector(kind === 'open' ? '.pm-filter-open-btn' : '.pm-filter-sale-btn');
+  if (btn) btn.textContent = kind === 'open' ? pmOpenBtnText() : pmSaleBtnText();
+}
+
+async function pmRunBatch(kind, items, step) {
+  document.querySelectorAll('.pm-filter-open-btn, .pm-filter-sale-btn').forEach(b => { b.disabled = true; });
+  for (let i = 0; i < items.length; i++) {
+    pmSetBusy(kind, i + 1, items.length);
+    step(items[i]);
+    if (i < items.length - 1) await new Promise(r => setTimeout(r, PM_BATCH_DELAY));
   }
-  pmOpenProgress = null;
+  pmBusy = null;
   pmRenderFilterPanel();
+}
+
+function pmOpenMacroLinks() {
+  if (pmBusy) return;
+  const items = pmGetBatch().filter(b => b.link);
+  if (!items.length) return;
+  pmRunBatch('open', items, b => chrome.runtime.sendMessage({ action: 'open-tab', url: b.link }));
+}
+
+function pmSetBatchSale() {
+  if (pmBusy) return;
+  const items = pmSaleCandidates(pmGetBatch());
+  if (!items.length) return;
+  const ids = items.map(b => `#${b.bidId}`).join(', ');
+  if (!confirm(`Перевести в статус «аккаунты в продаже» ${items.length} заявок?\n\n${ids}`)) return;
+  pmRunBatch('sale', items, b => {
+    if (!PM_REVIEW_STATUS.has(b.select.value)) return; // status changed meanwhile
+    b.select.value = PM_SALE_STATUS;
+    b.select.dispatchEvent(new Event('change', { bubbles: true })); // fires the page's onchange → admin_bids.change_status
+  });
 }
 
 function pmRenderFilterPanel() {
@@ -106,10 +148,18 @@ function pmRenderFilterPanel() {
   const openBtn = document.createElement('button');
   openBtn.className = 'pm-filter-btn pm-filter-open-btn';
   openBtn.textContent = pmOpenBtnText();
-  openBtn.title = 'Открыть ссылки «Править значения заявки» видимых заявок в новых вкладках';
-  openBtn.disabled = !!pmOpenProgress;
+  openBtn.title = `Открыть «Править значения заявки» у первых ${PM_BATCH_LIMIT} видимых заявок в новых вкладках`;
+  openBtn.disabled = !!pmBusy;
   openBtn.onclick = pmOpenMacroLinks;
   panel.appendChild(openBtn);
+
+  const saleBtn = document.createElement('button');
+  saleBtn.className = 'pm-filter-btn pm-filter-sale-btn';
+  saleBtn.textContent = pmSaleBtnText();
+  saleBtn.title = `Перевести первые ${PM_BATCH_LIMIT} видимых заявок со статусом «на проверке» в «аккаунты в продаже»`;
+  saleBtn.disabled = !!pmBusy;
+  saleBtn.onclick = pmSetBatchSale;
+  panel.appendChild(saleBtn);
 
   const sep = document.createElement('span');
   sep.className = 'pm-filter-sep';

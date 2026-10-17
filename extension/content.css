@@ -55,3 +55,6 @@ tr.pm-hidden-by-filter { display: none !important; }
   box-shadow: 0 3px 12px rgba(0,0,0,.25);
 }
 .pm-float-save:hover { background: #196f3d; }
+.pm-filter-sale-btn { background: #148f77; color: #fff; border-color: #0e6655; font-weight: 600; }
+.pm-filter-sale-btn:hover { background: #0e6655; }
+.pm-filter-sale-btn:disabled { background: #7f8c8d; border-color: #7f8c8d; cursor: default; }
