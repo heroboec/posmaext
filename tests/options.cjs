@@ -8,7 +8,7 @@ function setup(initial = {}) {
   const dom = new JSDOM(read('options.html'), { runScripts: 'outside-only' });
   const w = dom.window, data = { ...initial }, writes = [];
   w.chrome = {
-    runtime: { getManifest: () => ({ version: '2.13' }), reload() {} },
+    runtime: { getManifest: () => ({ version: '2.14' }), reload() {} },
     storage: { local: {
       remove() {}, get: (_, cb) => cb(data),
       set: (value, cb) => { writes.push(value); Object.assign(data, value); cb(); },
@@ -18,10 +18,12 @@ function setup(initial = {}) {
   return { dom, w, data, writes, q: sel => w.document.querySelector(sel) };
 }
 
-test('options: defaults, custom lines, empty list and restoring defaults are saved explicitly', () => {
+test('options: empty by default; only user-entered reasons are saved', () => {
   const s = setup({ urlPatterns: ['/bids'] });
   try {
-    assert.equal(s.q('#reason-count').textContent, 'Причин: 12');
+    assert.equal(s.q('#reason-count').textContent, 'Причин: 0');
+    assert.equal(s.q('#decline-reasons').value, '');
+    assert.equal(s.q('#restore-reasons'), null);
     assert.equal(s.q('#url-patterns').value, '/bids');
     assert.equal(s.writes.length, 0);
     s.q('#decline-reasons').value = ' First reason \n\nВторая причина с ссылкой https://example.test\n';
@@ -32,9 +34,6 @@ test('options: defaults, custom lines, empty list and restoring defaults are sav
     assert.deepEqual(Array.from(s.data.urlPatterns), ['/bids']);
     s.q('#decline-reasons').value = ''; s.q('#save-btn').click();
     assert.equal(s.data.declineReasons.length, 0);
-    s.q('#restore-reasons').click();
-    assert.equal(s.data.declineReasons.length, 0);
-    s.q('#save-btn').click(); assert.equal(s.data.declineReasons.length, 12);
   } finally { s.dom.window.close(); }
 });
 
@@ -80,5 +79,23 @@ test('options: read and storage failures are shown without losing edited text', 
     assert.match(s.q('#status').textContent, /quota error/);
     assert.equal(s.q('#decline-reasons').value, 'Keep me');
     assert.equal(s.q('#save-btn').disabled, false);
+  } finally { s.dom.window.close(); }
+});
+
+test('export: 12 UTF-8 lines import without changing text or URLs', async () => {
+  const text = Array.from({ length: 12 }, (_, i) => `TEST_MESSAGE_${i + 1}`).join('\n') + '\n';
+  const lines = text.trimEnd().split('\n');
+  assert.equal(lines.length, 12);
+  assert.ok(lines.every(line => line.trim() === line && line.length > 0));
+  const s = setup();
+  try {
+    const file = new s.w.File([text], 'rejection-reasons.txt', { type: 'text/plain' });
+    Object.defineProperty(s.q('#reason-file'), 'files', { value: [file] });
+    s.q('#reason-file').dispatchEvent(new s.w.Event('change'));
+    for (let i = 0; i < 100 && s.q('#save-btn').disabled; i++) await new Promise(r => setTimeout(r, 5));
+    assert.equal(s.q('#decline-reasons').value, lines.join('\n'));
+    assert.equal(s.writes.length, 0);
+    s.q('#save-btn').click();
+    assert.deepEqual(Array.from(s.data.declineReasons), lines);
   } finally { s.dom.window.close(); }
 });

@@ -39,14 +39,13 @@
 
   <div class="section">
     <div class="section-title">Причины отклонения</div>
-    <div class="hint">Одна причина — одна строка. Вставьте список или загрузите текстовый файл .txt в UTF-8. Пустые строки пропускаются.</div>
+    <div class="hint">Список изначально пуст. Одна причина — одна строка. Вставьте список или загрузите текстовый файл .txt в UTF-8. Пустые строки пропускаются.</div>
     <label for="decline-reasons">Текст причин для отправки партнёру</label>
     <textarea id="decline-reasons" spellcheck="false" aria-describedby="reasons-hint"></textarea>
     <div class="hint" id="reasons-hint">Список используется при одиночном и массовом отклонении. Перед отправкой текст можно изменить. Пустой список оставит только ручной ввод.</div>
     <label for="reason-file">Загрузить список из файла</label>
     <input type="file" id="reason-file" accept=".txt,text/plain">
     <div class="row" style="margin-top: 12px">
-      <button type="button" class="secondary" id="restore-reasons">Вернуть стандартные причины</button>
       <span id="reason-count"></span>
     </div>
     <p id="reason-status" role="status"></p>

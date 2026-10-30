@@ -251,7 +251,7 @@ function pmAddFloatingSave(form) {
 // ── Decline bid from the macro-values page ───────────────────────────────────
 
 const PM_DECLINED_STATUS = '4';
-let pmDeclineReasons = [...PM_REASONS.defaults];
+let pmDeclineReasons = [];
 
 // Shadow DOM keeps the site's form styles out of the rejection dialog.
 const PM_DECLINE_DIALOG_CSS = `

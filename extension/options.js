@@ -8,7 +8,6 @@ const reasonsEl = document.getElementById('decline-reasons');
 const saveBtn = document.getElementById('save-btn');
 const reasonStatusEl = document.getElementById('reason-status');
 const fileEl = document.getElementById('reason-file');
-const restoreBtn = document.getElementById('restore-reasons');
 let settingsLoaded = false;
 
 document.getElementById('current-version').textContent = currentVersion;
@@ -61,15 +60,10 @@ reasonsEl.addEventListener('input', () => {
   reasonStatusEl.textContent = 'Изменения не сохранены.';
 });
 
-restoreBtn.addEventListener('click', () => {
-  reasonsEl.value = PM_REASONS.defaults.join('\n');
-  reasonsEl.dispatchEvent(new Event('input'));
-});
-
 fileEl.addEventListener('change', async () => {
   const file = fileEl.files[0];
   if (!file) return;
-  saveBtn.disabled = reasonsEl.disabled = fileEl.disabled = restoreBtn.disabled = true;
+  saveBtn.disabled = reasonsEl.disabled = fileEl.disabled = true;
   reasonStatusEl.className = '';
   reasonStatusEl.textContent = 'Загружаю файл…';
   statusEl.textContent = '';
@@ -89,7 +83,7 @@ fileEl.addEventListener('change', async () => {
     reasonStatusEl.className = 'err';
     reasonStatusEl.textContent = e.message;
   } finally {
-    reasonsEl.disabled = fileEl.disabled = restoreBtn.disabled = false;
+    reasonsEl.disabled = fileEl.disabled = false;
     saveBtn.disabled = !settingsLoaded;
     fileEl.value = '';
   }

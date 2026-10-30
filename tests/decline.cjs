@@ -5,12 +5,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../extension/rejection-reasons.js'), 'utf8') + '\n' +
   fs.readFileSync(path.join(__dirname, '../extension/content.js'), 'utf8');
+// Simulate a user who imported the exported list, not application defaults.
+const importedReasons = Array.from({ length: 12 }, (_, i) => `TEST_MESSAGE_${String(i + 1).padStart(2, '0')}`);
 const row = (id, rowClass = 'tr_default') => `<tr class="${rowClass} bids-tr-table-new"><td>
 <select id="status_id${id}" data-current-status="2" onchange="window.nativeChanges++">
 <option value="2" selected>Review</option><option value="3">Sale</option><option value="4">Declined</option></select>
 <div class="bids-section-reason" style="display:none"><span class="bids-edit-reason-${id}"></span></div>
 </td></tr>`;
-function setup(macro = false, patterns = ['/bids'], count = 1, rowClasses = [], declineReasons) {
+function setup(macro = false, patterns = ['/bids'], count = 1, rowClasses = [], declineReasons = importedReasons) {
   const dom = new JSDOM(`<meta name="csrf-token" content="test-token">${macro ?
     '<form id="bid-macro-values-edit-form" action="/bids/macro-values-save/42"><button type="submit">Save</button></form>' :
     `<table><tbody>${Array.from({length: count}, (_, i) => row(42 + i, rowClasses[i])).join('')}</tbody></table>`}`, {
@@ -313,7 +315,7 @@ test('settings updates: open dialog keeps its draft and template mapping; next d
     s.open(); assert.equal(s.q('.pm-reason-template').options.length, 1);
     s.q('.pm-modal-cancel').click();
     s.storageListeners.forEach(cb => cb({ declineReasons: {} }, 'local'));
-    s.open(); assert.equal(s.q('.pm-reason-template').options.length, 13);
+    s.open(); assert.equal(s.q('.pm-reason-template').options.length, 1);
   } finally { s.dom.window.close(); }
 });
 
@@ -329,5 +331,16 @@ test('selected batch uses the updated custom reason', async () => {
     for (let i = 0; i < 100 && s.q('.pm-modal-backdrop'); i++) await new Promise(r => setTimeout(r, 5));
     assert.equal(s.requests.length, 2);
     assert.ok(s.requests.every(r => r.body.get('message') === 'Shared custom reason'));
+  } finally { s.dom.window.close(); }
+});
+
+test('without a saved list: no built-in templates, manual rejection still sends', async () => {
+  const s = setup(true, [], 1, [], null);
+  try {
+    s.open();
+    assert.equal(s.q('.pm-reason-template').options.length, 1);
+    s.q('.pm-modal-reason').value = 'Reason typed by operator';
+    s.q('.pm-modal-submit').click(); await settle();
+    assert.equal(s.requests[0].body.get('message'), 'Reason typed by operator');
   } finally { s.dom.window.close(); }
 });
