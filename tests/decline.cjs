@@ -9,10 +9,10 @@ const row = id => `<tr class="tr_default bids-tr-table-new"><td>
 <option value="2" selected>Review</option><option value="3">Sale</option><option value="4">Declined</option></select>
 <div class="bids-section-reason" style="display:none"><span class="bids-edit-reason-${id}"></span></div>
 </td></tr>`;
-function setup(macro = false, patterns = ['/bids']) {
+function setup(macro = false, patterns = ['/bids'], count = 1) {
   const dom = new JSDOM(`<meta name="csrf-token" content="test-token">${macro ?
     '<form id="bid-macro-values-edit-form" action="/bids/macro-values-save/42"><button type="submit">Save</button></form>' :
-    `<table><tbody>${row(42)}</tbody></table>`}`, {
+    `<table><tbody>${Array.from({length: count}, (_, i) => row(42 + i)).join('')}</tbody></table>`}`, {
     url: `https://example.test/bids/${macro ? 'macro-values/42' : 'list'}`, runScripts: 'dangerously',
   });
   const w = dom.window;
@@ -24,7 +24,7 @@ function setup(macro = false, patterns = ['/bids']) {
     return { ok: true, text: async () => '{"status":"ok"}' };
   };
   w.eval(source);
-  const q = s => w.document.querySelector(s) || w.document.querySelector('.pm-modal-backdrop')?.shadowRoot.querySelector(s) || null;
+  const q = s => w.document.querySelector(s) || w.document.querySelector('.pm-modal-backdrop')?.shadowRoot.querySelector(s) || w.document.querySelector('.pm-selection-toolbar')?.shadowRoot.querySelector(s) || null;
   const change = (el, value) => { el.value = value; el.dispatchEvent(new w.Event('change', { bubbles: true })); };
   const open = () => macro ? q('.pm-float-decline').click() : change(q('#status_id42'), '4');
   return { dom, w, q, change, open, requests };
@@ -156,4 +156,90 @@ test('page bridge: late site initialization and fallback without the content scr
     assert.equal(dom.window.admin_bids.change_status(42, 4), 'original');
     assert.equal(calls, 1);
   } finally { dom.window.close(); }
+});
+
+test('selected batch: more than 10, DOM order, same edited reason, sequential requests', async () => {
+  const s = setup(false, [], 12);
+  try {
+    const delays = [];
+    const timeout = s.w.setTimeout.bind(s.w);
+    s.w.setTimeout = (fn, ms, ...args) => {
+      if (ms === 800) { delays.push(ms); return timeout(fn, 1, ...args); }
+      return timeout(fn, ms, ...args);
+    };
+    let active = 0, maxActive = 0;
+    const fetch = s.w.fetch;
+    s.w.fetch = async (...args) => {
+      active++; maxActive = Math.max(maxActive, active);
+      await new Promise(r => setTimeout(r, 2));
+      const result = await fetch(...args); active--; return result;
+    };
+    assert.equal(s.w.document.querySelectorAll('.pm-bid-select').length, 12);
+    s.q('.pm-selection-all').click();
+    assert.equal(s.q('.pm-selection-count').textContent, 'Выбрано: 12');
+    s.q('.pm-selection-decline').click();
+    assert.match(s.q('.pm-modal-title').textContent, /12/);
+    assert.match(s.q('.pm-modal-summary').textContent, /#53/);
+    s.change(s.q('.pm-reason-template'), '1');
+    s.q('.pm-modal-reason').value += ' Corrected.';
+    const expected = s.q('.pm-modal-reason').value;
+    s.q('.pm-modal-submit').click();
+    assert.equal(s.q('.pm-bid-select').disabled, true);
+    for (let i = 0; i < 100 && s.q('.pm-modal-backdrop'); i++) await new Promise(r => setTimeout(r, 5));
+    assert.equal(s.q('.pm-modal-backdrop'), null);
+    assert.equal(s.requests.length, 12);
+    assert.deepEqual(s.requests.map(r => r.body.get('bid_id')), Array.from({length:12}, (_, i) => String(42+i)));
+    assert.ok(s.requests.every(r => r.body.get('message') === expected));
+    assert.equal(maxActive, 1);
+    assert.equal(delays.length, 11);
+    assert.equal(s.q('.pm-selection-count').textContent, 'Выбрано: 0');
+    assert.match(s.q('.pm-selection-result').textContent, /Отклонено: 12 из 12/);
+  } finally { s.dom.window.close(); }
+});
+
+test('selected batch: partial failure retains failed selection; retry excludes successes', async () => {
+  const s = setup(false, ['/bids'], 3);
+  try {
+    const timeout = s.w.setTimeout.bind(s.w);
+    s.w.setTimeout = (fn, ms, ...args) => timeout(fn, ms === 800 ? 1 : ms, ...args);
+    const fetch = s.w.fetch;
+    let fail = true;
+    s.w.fetch = async (...args) => {
+      const result = await fetch(...args);
+      const id = s.requests.at(-1).body.get('bid_id');
+      return fail && id === '43' ? { ok: false, status: 500, text: async () => 'error' } : result;
+    };
+    s.q('.pm-selection-all').click(); s.q('.pm-selection-decline').click();
+    s.q('.pm-modal-reason').value = 'Manual batch reason';
+    s.q('.pm-modal-submit').click();
+    for (let i = 0; i < 100 && s.q('.pm-modal-submit').disabled; i++) await new Promise(r => setTimeout(r, 5));
+    assert.equal(s.q('#status_id42').value, '4');
+    assert.equal(s.q('#status_id43').value, '2');
+    assert.equal(s.q('#status_id44').value, '4');
+    assert.match(s.q('.pm-modal-error').textContent, /#43/);
+    assert.equal(s.q('.pm-modal-reason').value, 'Manual batch reason');
+    assert.equal(s.q('.pm-selection-count').textContent, 'Выбрано: 1');
+    fail = false; s.q('.pm-modal-submit').click(); await settle();
+    assert.deepEqual(s.requests.map(r => r.body.get('bid_id')), ['42','43','44','43']);
+    assert.equal(s.q('.pm-modal-backdrop'), null);
+    assert.match(s.q('.pm-selection-result').textContent, /Отклонено: 3 из 3/);
+  } finally { s.dom.window.close(); }
+});
+
+test('selected batch: cancellation sends nothing; hidden and removed rows are deselected', async () => {
+  const s = setup(false, [], 3);
+  try {
+    s.q('.pm-selection-all').click(); s.q('.pm-selection-decline').click();
+    s.q('.pm-modal-cancel').click(); assert.equal(s.requests.length, 0);
+    s.q('#status_id43').closest('tr').classList.add('pm-hidden-by-filter');
+    s.q('#status_id44').closest('tr').remove();
+    await new Promise(r => setTimeout(r, 180));
+    assert.equal(s.q('.pm-selection-count').textContent, 'Выбрано: 1');
+    s.q('.pm-selection-decline').click();
+    assert.equal(s.q('.pm-modal-summary').textContent, '#42');
+    s.q('.pm-modal-cancel').click();
+    s.q('tbody').insertAdjacentHTML('beforeend', row(45)); await new Promise(r => setTimeout(r, 180));
+    assert.equal(s.w.document.querySelectorAll('.pm-bid-select').length, 3);
+    assert.equal(s.q('#status_id45').closest('tr').querySelector('.pm-bid-select').checked, false);
+  } finally { s.dom.window.close(); }
 });

@@ -75,3 +75,12 @@ tr.pm-hidden-by-filter { display: none !important; }
 }
 .pm-float-decline:hover { background: #a93226; }
 .pm-float-decline:disabled { background: #7f8c8d; cursor: default; }
+
+input.pm-bid-select[type="checkbox"] {
+  appearance: auto !important; position: static !important; opacity: 1 !important;
+  display: inline-block !important; width: 18px !important; height: 18px !important;
+  margin: 4px 10px 4px 0 !important; padding: 0 !important; float: left;
+  cursor: pointer; accent-color: #c0392b; vertical-align: middle;
+}
+input.pm-bid-select:disabled { cursor: default; }
+tr.pm-bid-selected > td:first-child { box-shadow: inset 3px 0 #c0392b; }

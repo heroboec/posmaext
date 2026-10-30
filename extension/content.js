@@ -5,6 +5,9 @@ const pmActiveFilters = new Set(); // selected category names
 const pmKnownCats     = new Map(); // name → { name, icon }
 let   pmAllExpanded   = false;
 let   pmObserver      = null;
+const pmSelectedBids = new Set();
+const pmPreviousStatus = new WeakMap();
+let pmSelectionResult = '';
 
 function pmUrlMatches() {
   if (!pmUrlPatterns.length) return false;
@@ -34,6 +37,7 @@ function pmApplyFilter() {
       detail.classList.toggle('pm-hidden-by-filter', hide);
     }
   });
+  pmSyncSelection();
 }
 
 function pmToggleAllDetails() {
@@ -95,6 +99,7 @@ function pmSaleBtnText() {
 
 function pmSetBusy(kind, i, total) {
   pmBusy = { kind, progress: `${i}/${total}` };
+  pmSyncSelection();
   const btn = document.querySelector(kind === 'open' ? '.pm-filter-open-btn' : '.pm-filter-sale-btn');
   if (btn) btn.textContent = kind === 'open' ? pmOpenBtnText() : pmSaleBtnText();
 }
@@ -108,17 +113,18 @@ async function pmRunBatch(kind, items, step) {
   }
   pmBusy = null;
   pmRenderFilterPanel();
+  pmSyncSelection();
 }
 
 function pmOpenMacroLinks() {
-  if (pmBusy) return;
+  if (pmBusy || document.querySelector('.pm-modal-backdrop')) return;
   const items = pmGetBatch().filter(b => b.link);
   if (!items.length) return;
   pmRunBatch('open', items, b => chrome.runtime.sendMessage({ action: 'open-tab', url: b.link }));
 }
 
 function pmSetBatchSale() {
-  if (pmBusy) return;
+  if (pmBusy || document.querySelector('.pm-modal-backdrop')) return;
   const items = pmSaleCandidates(pmGetBatch());
   if (!items.length) return;
   const ids = items.map(b => `#${b.bidId}`).join(', ');
@@ -270,6 +276,8 @@ const PM_DECLINE_DIALOG_CSS = `
   .pm-modal-reason::placeholder { color: #7b8492; opacity: 1; }
   .pm-reason-template:focus, .pm-modal-reason:focus { outline: 2px solid #bfdbfe;
     outline-offset: 1px; border-color: #3b82f6; }
+  .pm-modal-summary { max-height: 90px; overflow-y: auto; overflow-wrap: anywhere; color: #64748b; margin: 0 0 16px; }
+  .pm-modal-summary:empty { display: none; }
   .pm-modal-hint { margin: -8px 0 16px; color: #64748b; font-size: 12px; }
   .pm-modal-error { color: #b91c1c; margin: 0 0 12px; overflow-wrap: anywhere; }
   .pm-modal-error:empty { display: none; }
@@ -288,7 +296,7 @@ const PM_DECLINE_DIALOG_CSS = `
 // Intercept only rejection on bid rows; other statuses retain the site's handler.
 // Capture runs before the select's inline onchange, avoiding a second dialog/request.
 function pmInitListDecline() {
-  const previous = new WeakMap();
+  const previous = pmPreviousStatus;
   const isStatus = el => el instanceof HTMLSelectElement &&
     /^status_id\d+$/.test(el.id) &&
     (el.hasAttribute('data-current-status') || el.closest('tr.tr_default.bids-tr-table-new'));
@@ -303,17 +311,7 @@ function pmInitListDecline() {
     select.value = oldStatus;
     const bidId = select.id.slice('status_id'.length);
     pmShowDeclineDialog(bidId, message => {
-      select.value = PM_DECLINED_STATUS;
-      select.dataset.currentStatus = PM_DECLINED_STATUS;
-      previous.set(select, PM_DECLINED_STATUS);
-      const row = select.closest('tr');
-      const reason = row?.querySelector(`.bids-edit-reason-${bidId}`);
-      if (reason) {
-        reason.textContent = message;
-        reason.title = message;
-        const section = reason.closest('.bids-section-reason');
-        if (section) section.style.display = '';
-      }
+      pmMarkDeclined(select, bidId, message);
       if (pmUrlMatches()) pmRenderFilterPanel();
     });
   };
@@ -325,6 +323,7 @@ function pmInitListDecline() {
       return;
     }
     e.stopImmediatePropagation();
+    if (pmBusy) { select.value = previous.get(select) || select.dataset.currentStatus || ''; return; }
     open(select);
   }, true);
   // The page bridge also catches jQuery-triggered and direct change_status calls.
@@ -332,8 +331,160 @@ function pmInitListDecline() {
     if (!enabled() || !isStatus(e.target)) return;
     e.preventDefault(); // tells the bridge that our dialog took over
     e.stopImmediatePropagation();
-    open(e.target);
+    if (!pmBusy) open(e.target);
   }, true);
+}
+
+// Selection is explicit and independent from the 10-row open/sale batches.
+function pmListEnabled() {
+  return !pmIsMacroValuesPage() &&
+    (pmUrlMatches() || /^\/(?:[a-z]{2}\/?)?bids(?:\/|$)/i.test(location.pathname));
+}
+
+function pmSelectableRows() {
+  return [...document.querySelectorAll('tr.tr_default.bids-tr-table-new')].flatMap(row => {
+    const select = row.querySelector('select[id^="status_id"]');
+    const bidId = select?.id.match(/^status_id(\d+)$/)?.[1];
+    if (!bidId) return [];
+    const visible = !row.classList.contains('pm-hidden-by-filter') && !row.hidden &&
+      getComputedStyle(row).display !== 'none';
+    return [{ row, select, bidId, eligible: visible && select.value !== PM_DECLINED_STATUS }];
+  });
+}
+
+function pmMarkDeclined(select, bidId, message) {
+  select.value = PM_DECLINED_STATUS;
+  select.dataset.currentStatus = PM_DECLINED_STATUS;
+  pmPreviousStatus.set(select, PM_DECLINED_STATUS);
+  pmSelectedBids.delete(bidId);
+  const reason = select.closest('tr')?.querySelector(`.bids-edit-reason-${bidId}`);
+  if (reason) {
+    reason.textContent = reason.title = message;
+    const section = reason.closest('.bids-section-reason');
+    if (section) section.style.display = '';
+  }
+  pmSyncSelection();
+}
+
+function pmSyncSelection() {
+  if (!pmListEnabled()) return;
+  const rows = pmSelectableRows();
+  const eligibleIds = new Set(rows.filter(b => b.eligible).map(b => b.bidId));
+  for (const id of pmSelectedBids) if (!eligibleIds.has(id)) pmSelectedBids.delete(id);
+  for (const { row, bidId, eligible } of rows) {
+    let box = row.querySelector('.pm-bid-select');
+    if (!box && row.cells[0]) {
+      box = document.createElement('input');
+      box.type = 'checkbox';
+      box.className = 'pm-bid-select';
+      box.setAttribute('aria-label', `Выбрать заявку #${bidId} для отклонения`);
+      box.title = `Выбрать заявку #${bidId} для отклонения`;
+      box.addEventListener('click', e => e.stopPropagation());
+      box.addEventListener('change', e => {
+        e.stopPropagation();
+        if (!pmBusy) {
+          box.checked ? pmSelectedBids.add(bidId) : pmSelectedBids.delete(bidId);
+          pmSelectionResult = '';
+        }
+        pmSyncSelection();
+      });
+      row.cells[0].prepend(box);
+    }
+    if (box) { box.checked = pmSelectedBids.has(bidId); box.disabled = !!pmBusy || !eligible; }
+    row.classList.toggle('pm-bid-selected', pmSelectedBids.has(bidId));
+  }
+  let host = document.querySelector('.pm-selection-toolbar');
+  const table = rows[0]?.row.closest('table');
+  if (!host && table) {
+    host = document.createElement('div');
+    host.className = 'pm-selection-toolbar';
+    const root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>
+      :host { display: block; margin: 12px 0; }
+      .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px;
+        border: 1px solid #d7dee7; border-radius: 8px; background: #fff;
+        color: #334155; font: 14px/1.4 system-ui, sans-serif; }
+      button { padding: 8px 12px; min-height: 36px; border: 1px solid #cbd5e1;
+        border-radius: 5px; background: white; color: #334155; font: inherit; cursor: pointer; }
+      .pm-selection-decline { background: #c0392b; border-color: #c0392b; color: white; }
+      button:disabled { opacity: .5; cursor: default; }
+      .pm-selection-result { flex-basis: 100%; white-space: pre-wrap; }
+      .pm-selection-result:empty { display: none; }
+    </style><div class="bar">
+      <span class="pm-selection-count"></span>
+      <button type="button" class="pm-selection-all">Выбрать все видимые</button>
+      <button type="button" class="pm-selection-clear">Снять выбор</button>
+      <button type="button" class="pm-selection-decline">Отклонить выбранные</button>
+      <span class="pm-selection-result" role="status"></span>
+    </div>`;
+    root.querySelector('.pm-selection-all').onclick = () => {
+      if (pmBusy) return;
+      pmSelectableRows().filter(b => b.eligible).forEach(b => pmSelectedBids.add(b.bidId));
+      pmSelectionResult = '';
+      pmSyncSelection();
+    };
+    root.querySelector('.pm-selection-clear').onclick = () => {
+      if (pmBusy) return;
+      pmSelectedBids.clear(); pmSelectionResult = ''; pmSyncSelection();
+    };
+    root.querySelector('.pm-selection-decline').onclick = pmDeclineSelected;
+    table.before(host);
+  }
+  if (host) {
+    const root = host.shadowRoot;
+    const count = pmSelectedBids.size;
+    root.querySelector('.pm-selection-count').textContent = `Выбрано: ${count}`;
+    root.querySelector('.pm-selection-all').disabled = !!pmBusy || !eligibleIds.size;
+    root.querySelector('.pm-selection-clear').disabled = !!pmBusy || !count;
+    root.querySelector('.pm-selection-decline').disabled = !!pmBusy || !count;
+    root.querySelector('.pm-selection-result').textContent = pmSelectionResult;
+  }
+  pmObserver?.takeRecords();
+}
+
+function pmDeclineSelected() {
+  if (pmBusy || document.querySelector('.pm-modal-backdrop')) return;
+  pmSyncSelection();
+  let pending = pmSelectableRows().filter(b => b.eligible && pmSelectedBids.has(b.bidId))
+    .map(b => ({ ...b, status: b.select.value }));
+  if (!pending.length) return;
+  const total = pending.length;
+  let succeeded = 0;
+  pmShowDeclineDialog(null, () => {}, {
+    title: `Отклонить выбранные заявки (${total})`,
+    summary: pending.map(b => `#${b.bidId}`).join(', '),
+    send: async (message, progress) => {
+      if (pmBusy) throw new Error('Дождитесь завершения текущей операции');
+      pmBusy = { kind: 'decline', progress: '' };
+      document.querySelectorAll('.pm-filter-open-btn, .pm-filter-sale-btn').forEach(b => { b.disabled = true; });
+      pmSyncSelection();
+      const failed = [], errors = [];
+      try {
+        for (let i = 0; i < pending.length; i++) {
+          const item = pending[i];
+          progress(`Отклоняю ${i + 1} из ${pending.length}…`);
+          try {
+            const current = pmSelectableRows().find(b => b.bidId === item.bidId);
+            if (!current?.eligible || current.select.value !== item.status) {
+              throw new Error('строка или статус изменились; проверьте заявку');
+            }
+            await pmDeclineBid(item.bidId, message);
+            succeeded++;
+            pmMarkDeclined(current.select, item.bidId, message);
+          } catch (e) { failed.push(item); errors.push(`#${item.bidId}: ${e.message}`); }
+          if (i < pending.length - 1) await new Promise(r => setTimeout(r, PM_BATCH_DELAY));
+        }
+        pending = failed; // A retry never sends successful requests again.
+        pmSelectionResult = `Отклонено: ${succeeded} из ${total}.` +
+          (errors.length ? ` Не удалось: ${errors.join('; ')}` : '');
+      } finally {
+        pmBusy = null;
+        if (pmUrlMatches()) pmRenderFilterPanel();
+        pmSyncSelection();
+      }
+      if (pending.length) throw new Error(pmSelectionResult);
+    },
+  });
 }
 
 function pmGetCsrf() {
@@ -368,7 +519,7 @@ async function pmDeclineBid(bidId, message) {
   return json;
 }
 
-function pmShowDeclineDialog(bidId, onDone) {
+function pmShowDeclineDialog(bidId, onDone, options = {}) {
   if (document.querySelector('.pm-modal-backdrop')) return;
   const backdrop = document.createElement('div');
   backdrop.className = 'pm-modal-backdrop';
@@ -382,6 +533,7 @@ function pmShowDeclineDialog(bidId, onDone) {
   overlay.innerHTML = `
     <div class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-decline-title">
       <h2 class="pm-modal-title" id="pm-decline-title"></h2>
+      <p class="pm-modal-summary"></p>
       <label class="pm-reason-label">Шаблон причины
         <select class="pm-reason-template"><option value="">Выберите причину из списка</option></select>
       </label>
@@ -395,7 +547,8 @@ function pmShowDeclineDialog(bidId, onDone) {
         <button type="button" class="pm-modal-submit">Отклонить</button>
       </div>
     </div>`;
-  root.querySelector('.pm-modal-title').textContent = `Отклонить заявку #${bidId}`;
+  root.querySelector('.pm-modal-title').textContent = options.title || `Отклонить заявку #${bidId}`;
+  root.querySelector('.pm-modal-summary').textContent = options.summary || '';
   const reason = root.querySelector('.pm-modal-reason');
   const template = root.querySelector('.pm-reason-template');
   PM_DECLINE_REASONS.forEach((text, index) => {
@@ -425,13 +578,14 @@ function pmShowDeclineDialog(bidId, onDone) {
     submit.disabled = cancel.disabled = reason.disabled = template.disabled = true;
     submit.textContent = 'Отправляю…';
     try {
-      await pmDeclineBid(bidId, message);
+      if (options.send) await options.send(message, text => { submit.textContent = text; });
+      else await pmDeclineBid(bidId, message);
       close();
       onDone(message);
     } catch (e) {
-      errorEl.textContent = `✗ Не удалось: ${e.message}`;
+      errorEl.textContent = options.send ? e.message : `✗ Не удалось: ${e.message}`;
       submit.disabled = cancel.disabled = reason.disabled = template.disabled = false;
-      submit.textContent = 'Отклонить';
+      submit.textContent = options.send ? 'Повторить неудавшиеся' : 'Отклонить';
     }
   };
 
@@ -488,14 +642,19 @@ function pmIsMacroValuesPage() {
 
 function pmStart() {
   // The macro-values page has its own behaviour (field sorting + floating save), no filter panel.
-  if (pmObserver || !pmUrlMatches() || pmIsMacroValuesPage()) return;
-  pmUpdateFilterPanel();
+  if (pmObserver || !pmListEnabled()) return;
+  if (pmUrlMatches()) pmUpdateFilterPanel();
+  pmSyncSelection();
 
   let timer = null;
   pmObserver = new MutationObserver((mutations) => {
-    const onlyPm = mutations.every(m => m.target?.closest?.('.pm-filter-panel'));
+    const onlyPm = mutations.every(m => m.target?.closest?.('.pm-filter-panel, .pm-selection-toolbar, .pm-modal-backdrop'));
     if (onlyPm || timer) return;
-    timer = setTimeout(() => { timer = null; pmUpdateFilterPanel(); }, 150);
+    timer = setTimeout(() => {
+      timer = null;
+      if (pmUrlMatches()) pmUpdateFilterPanel();
+      pmSyncSelection();
+    }, 150);
   });
   pmObserver.observe(document.body, { childList: true, subtree: true });
 }
