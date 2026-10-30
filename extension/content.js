@@ -247,23 +247,57 @@ function pmAddFloatingSave(form) {
 const PM_DECLINED_STATUS = '4';
 const PM_DECLINE_REASONS = [];
 
+const PM_DECLINE_LABELS = [];
+
+// Shadow DOM keeps the site's form styles out of the rejection dialog.
+const PM_DECLINE_DIALOG_CSS = `
+  :host { all: initial !important; position: fixed !important; inset: 0 !important;
+    z-index: 2147483647 !important; display: block !important; }
+  *, *::before, *::after { box-sizing: border-box; }
+  .pm-dialog-overlay { position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; padding: 16px; background: rgba(15, 23, 42, .48); }
+  .pm-modal { width: 540px; max-width: 100%; max-height: calc(100dvh - 32px);
+    overflow-y: auto; padding: 24px; border-radius: 12px; background: #fff;
+    color: #1f2937; box-shadow: 0 16px 56px rgba(0,0,0,.24);
+    font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  .pm-modal-title { margin: 0 0 20px; font-size: 20px; font-weight: 650; line-height: 1.3; }
+  .pm-reason-label { display: block; margin: 0 0 16px; font-weight: 600; }
+  .pm-reason-template, .pm-modal-reason { display: block; width: 100%; margin: 6px 0 0;
+    border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; color: #1f2937;
+    font: 400 14px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  .pm-reason-template { height: 44px; padding: 0 12px; cursor: pointer; }
+  .pm-modal-reason { min-height: 150px; padding: 12px; resize: vertical; }
+  .pm-modal-reason::placeholder { color: #7b8492; opacity: 1; }
+  .pm-reason-template:focus, .pm-modal-reason:focus { outline: 2px solid #bfdbfe;
+    outline-offset: 1px; border-color: #3b82f6; }
+  .pm-modal-hint { margin: -8px 0 16px; color: #64748b; font-size: 12px; }
+  .pm-modal-error { color: #b91c1c; margin: 0 0 12px; overflow-wrap: anywhere; }
+  .pm-modal-error:empty { display: none; }
+  .pm-modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+  button { min-height: 40px; padding: 9px 18px; border-radius: 6px;
+    font: 600 14px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif; cursor: pointer; }
+  button:focus-visible { outline: 2px solid #3b82f6; outline-offset: 2px; }
+  .pm-modal-cancel { background: #fff; color: #374151; border: 1px solid #cbd5e1; }
+  .pm-modal-cancel:hover { background: #f1f5f9; }
+  .pm-modal-submit { background: #c0392b; color: #fff; border: 1px solid #c0392b; }
+  .pm-modal-submit:hover { background: #a93226; }
+  :disabled { opacity: .6; cursor: wait; }
+  @media (max-width: 420px) { .pm-modal { padding: 18px; } .pm-modal-title { font-size: 18px; } }
+`;
+
 // Intercept only rejection on bid rows; other statuses retain the site's handler.
 // Capture runs before the select's inline onchange, avoiding a second dialog/request.
 function pmInitListDecline() {
   const previous = new WeakMap();
   const isStatus = el => el instanceof HTMLSelectElement &&
-    /^status_id\d+$/.test(el.id) && el.closest('tr.tr_default.bids-tr-table-new');
+    /^status_id\d+$/.test(el.id) &&
+    (el.hasAttribute('data-current-status') || el.closest('tr.tr_default.bids-tr-table-new'));
+  const enabled = () => !pmIsMacroValuesPage() &&
+    (pmUrlMatches() || /^\/(?:[a-z]{2}\/?)?bids(?:\/|$)/i.test(location.pathname));
   const remember = e => { if (isStatus(e.target)) previous.set(e.target, e.target.value); };
   document.addEventListener('focusin', remember, true);
   document.addEventListener('pointerdown', remember, true);
-  document.addEventListener('change', e => {
-    const select = e.target;
-    if (!pmUrlMatches() || pmIsMacroValuesPage() || !isStatus(select)) return;
-    if (select.value !== PM_DECLINED_STATUS) {
-      previous.set(select, select.value);
-      return;
-    }
-    e.stopImmediatePropagation();
+  const open = select => {
     const oldStatus = previous.get(select) || select.dataset.currentStatus ||
       [...select.options].find(o => o.defaultSelected)?.value || '';
     select.value = oldStatus;
@@ -273,15 +307,32 @@ function pmInitListDecline() {
       select.dataset.currentStatus = PM_DECLINED_STATUS;
       previous.set(select, PM_DECLINED_STATUS);
       const row = select.closest('tr');
-      const reason = row.querySelector(`.bids-edit-reason-${bidId}`);
+      const reason = row?.querySelector(`.bids-edit-reason-${bidId}`);
       if (reason) {
         reason.textContent = message;
         reason.title = message;
         const section = reason.closest('.bids-section-reason');
         if (section) section.style.display = '';
       }
-      pmRenderFilterPanel();
+      if (pmUrlMatches()) pmRenderFilterPanel();
     });
+  };
+  document.addEventListener('change', e => {
+    const select = e.target;
+    if (!enabled() || !isStatus(select)) return;
+    if (select.value !== PM_DECLINED_STATUS) {
+      previous.set(select, select.value);
+      return;
+    }
+    e.stopImmediatePropagation();
+    open(select);
+  }, true);
+  // The page bridge also catches jQuery-triggered and direct change_status calls.
+  document.addEventListener('pm-request-decline', e => {
+    if (!enabled() || !isStatus(e.target)) return;
+    e.preventDefault(); // tells the bridge that our dialog took over
+    e.stopImmediatePropagation();
+    open(e.target);
   }, true);
 }
 
@@ -321,28 +372,37 @@ function pmShowDeclineDialog(bidId, onDone) {
   if (document.querySelector('.pm-modal-backdrop')) return;
   const backdrop = document.createElement('div');
   backdrop.className = 'pm-modal-backdrop';
-  backdrop.innerHTML = `
-    <div class="pm-modal" role="dialog" aria-modal="true">
-      <div class="pm-modal-title"></div>
+  const root = backdrop.attachShadow({ mode: 'open' });
+  const style = document.createElement('style');
+  style.textContent = PM_DECLINE_DIALOG_CSS;
+  root.appendChild(style);
+  const overlay = document.createElement('div');
+  overlay.className = 'pm-dialog-overlay';
+  root.appendChild(overlay);
+  overlay.innerHTML = `
+    <div class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-decline-title">
+      <h2 class="pm-modal-title" id="pm-decline-title"></h2>
       <label class="pm-reason-label">Шаблон причины
-        <select class="pm-reason-template"><option value="">Выберите шаблон (необязательно)</option></select>
+        <select class="pm-reason-template"><option value="">Выберите причину из списка</option></select>
       </label>
       <label class="pm-reason-label">Причина отклонения (увидит партнёр)
         <textarea class="pm-modal-reason" rows="5" placeholder="Выберите шаблон выше или напишите причину вручную"></textarea>
       </label>
-      <div class="pm-modal-error"></div>
+      <p class="pm-modal-hint">Текст можно изменить или написать свою причину.</p>
+      <div class="pm-modal-error" role="alert"></div>
       <div class="pm-modal-actions">
         <button type="button" class="pm-modal-cancel">Отмена</button>
         <button type="button" class="pm-modal-submit">Отклонить</button>
       </div>
     </div>`;
-  backdrop.querySelector('.pm-modal-title').textContent = `Отклонить заявку #${bidId}`;
-  const reason = backdrop.querySelector('.pm-modal-reason');
-  const template = backdrop.querySelector('.pm-reason-template');
+  root.querySelector('.pm-modal-title').textContent = `Отклонить заявку #${bidId}`;
+  const reason = root.querySelector('.pm-modal-reason');
+  const template = root.querySelector('.pm-reason-template');
   PM_DECLINE_REASONS.forEach((text, index) => {
     const option = document.createElement('option');
     option.value = String(index);
-    option.textContent = text;
+    option.textContent = PM_DECLINE_LABELS[index];
+    option.title = text;
     template.appendChild(option);
   });
   template.onchange = () => {
@@ -351,10 +411,11 @@ function pmShowDeclineDialog(bidId, onDone) {
     reason.dispatchEvent(new Event('input', { bubbles: true }));
     reason.focus();
   };
-  const errorEl = backdrop.querySelector('.pm-modal-error');
-  const submit = backdrop.querySelector('.pm-modal-submit');
-  const cancel = backdrop.querySelector('.pm-modal-cancel');
-  const close = () => backdrop.remove();
+  const errorEl = root.querySelector('.pm-modal-error');
+  const submit = root.querySelector('.pm-modal-submit');
+  const cancel = root.querySelector('.pm-modal-cancel');
+  const previouslyFocused = document.activeElement;
+  const close = () => { backdrop.remove(); previouslyFocused?.focus(); };
 
   const doSubmit = async () => {
     if (submit.disabled) return;
@@ -376,10 +437,17 @@ function pmShowDeclineDialog(bidId, onDone) {
 
   submit.onclick = doSubmit;
   cancel.onclick = close;
-  backdrop.addEventListener('mousedown', e => { if (e.target === backdrop && !cancel.disabled) close(); });
-  reason.addEventListener('keydown', e => {
+  overlay.addEventListener('mousedown', e => { if (e.target === overlay && !cancel.disabled) close(); });
+  root.addEventListener('keydown', e => {
     if (e.key === 'Escape' && !cancel.disabled) close();
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doSubmit();
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSubmit(); }
+    if (e.key === 'Tab') {
+      const controls = [template, reason, cancel, submit].filter(el => !el.disabled);
+      const first = controls[0], last = controls[controls.length - 1];
+      if (!first) { e.preventDefault(); return; }
+      if (e.shiftKey && root.activeElement === first) { e.preventDefault(); last.focus(); }
+      if (!e.shiftKey && root.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
   });
   document.body.appendChild(backdrop);
   reason.focus();

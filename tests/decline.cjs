@@ -24,7 +24,7 @@ function setup(macro = false, patterns = ['/bids']) {
     return { ok: true, text: async () => '{"status":"ok"}' };
   };
   w.eval(source);
-  const q = s => w.document.querySelector(s);
+  const q = s => w.document.querySelector(s) || w.document.querySelector('.pm-modal-backdrop')?.shadowRoot.querySelector(s) || null;
   const change = (el, value) => { el.value = value; el.dispatchEvent(new w.Event('change', { bubbles: true })); };
   const open = () => macro ? q('.pm-float-decline').click() : change(q('#status_id42'), '4');
   return { dom, w, q, change, open, requests };
@@ -37,13 +37,13 @@ for (const macro of [false, true]) {
       s.open();
       assert.equal(s.requests.length, 0);
       assert.equal(s.q('.pm-reason-template').options.length, 13);
-      assert.equal(s.q('.pm-reason-template').options[12].textContent, "TEST_MESSAGE_12");
+      assert.equal(s.q('.pm-reason-template').options[12].title, "TEST_MESSAGE_12");
       s.change(s.q('.pm-reason-template'), '7');
       assert.equal(s.q('.pm-modal-reason').value, 'TEST_MESSAGE_08');
       s.q('.pm-modal-reason').value += ' Edited by operator.';
       const expected = s.q('.pm-modal-reason').value;
       s.q('.pm-modal-submit').click();
-      s.q('.pm-modal-reason').dispatchEvent(new s.w.KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true }));
+      s.q('.pm-modal-reason').dispatchEvent(new s.w.KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
       await settle();
       assert.equal(s.requests.length, 1);
       assert.equal(s.requests[0].body.get('message'), expected);
@@ -93,10 +93,67 @@ test('list: other statuses, newly added rows and URL scope', () => {
     s.change(s.q('#status_id43'), '4');
     assert.match(s.q('.pm-modal-title').textContent, /43/);
   } finally { s.dom.window.close(); }
-  const other = setup(false, ['/different-path']);
+  const independent = setup(false, []);
+  try {
+    independent.open();
+    assert.ok(independent.q('.pm-modal-backdrop'));
+    assert.equal(independent.w.nativeChanges, 0);
+  } finally { independent.dom.window.close(); }
+  const other = setup(false, []);
+  other.dom.reconfigure({ url: 'https://example.test/unrelated' });
   try {
     other.open();
     assert.equal(other.q('.pm-modal-backdrop'), null);
     assert.equal(other.w.nativeChanges, 1);
   } finally { other.dom.window.close(); }
+});
+
+test('page bridge: direct site calls open our dialog without sending the native request', async () => {
+  const s = setup(false, []);
+  try {
+    const nativeCalls = [];
+    s.w.admin_bids = { change_status(...args) { nativeCalls.push({ self: this, args }); return 'native'; } };
+    s.w.eval(fs.readFileSync(path.join(__dirname, '../extension/page-bridge.js'), 'utf8'));
+    assert.equal(s.w.admin_bids.change_status(42, 3, 'extra'), 'native');
+    assert.equal(nativeCalls[0].self, s.w.admin_bids);
+    assert.deepEqual(nativeCalls[0].args, [42, 3, 'extra']);
+    s.q('#status_id42').value = '4';
+    s.w.admin_bids.change_status(42, 4);
+    assert.equal(nativeCalls.length, 1);
+    assert.ok(s.q('.pm-modal-backdrop'));
+    assert.equal(s.requests.length, 0);
+    s.change(s.q('.pm-reason-template'), '11');
+    s.q('.pm-modal-submit').click(); await settle();
+    assert.equal(s.requests.length, 1);
+    assert.equal(s.requests[0].body.get('message'), 'TEST_MESSAGE_12');
+    s.dom.reconfigure({ url: 'https://example.test/unrelated' });
+    assert.equal(s.w.admin_bids.change_status(42, 4), 'native');
+    assert.equal(nativeCalls.length, 2);
+  } finally { s.dom.window.close(); }
+});
+
+test('dialog: Escape from selector cancels; Tab stays inside the dialog', () => {
+  const s = setup(true);
+  try {
+    s.open();
+    const root = s.q('.pm-modal-backdrop').shadowRoot;
+    s.q('.pm-modal-submit').focus();
+    s.q('.pm-modal-submit').dispatchEvent(new s.w.KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+    assert.equal(root.activeElement, s.q('.pm-reason-template'));
+    s.q('.pm-reason-template').dispatchEvent(new s.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    assert.equal(s.q('.pm-modal-backdrop'), null);
+    assert.equal(s.requests.length, 0);
+  } finally { s.dom.window.close(); }
+});
+
+test('page bridge: late site initialization and fallback without the content script', async () => {
+  const dom = new JSDOM('<select id="status_id42"><option value="4">Declined</option></select>', { runScripts: 'outside-only' });
+  try {
+    dom.window.eval(fs.readFileSync(path.join(__dirname, '../extension/page-bridge.js'), 'utf8'));
+    let calls = 0;
+    dom.window.admin_bids = { change_status() { calls++; return 'original'; } };
+    await new Promise(r => setTimeout(r, 550));
+    assert.equal(dom.window.admin_bids.change_status(42, 4), 'original');
+    assert.equal(calls, 1);
+  } finally { dom.window.close(); }
 });
