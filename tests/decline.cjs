@@ -344,3 +344,19 @@ test('without a saved list: no built-in templates, manual rejection still sends'
     assert.equal(s.requests[0].body.get('message'), 'Reason typed by operator');
   } finally { s.dom.window.close(); }
 });
+
+for (const macro of [false, true]) {
+  test(`${macro ? 'edit' : 'list'}: custom short label is shown but never sent`, async () => {
+    const s = setup(macro, ['/bids'], 1, [], [{ label: 'Тестовая подпись', text: 'TEST_FULL_MESSAGE' }]);
+    try {
+      s.open();
+      assert.equal(s.q('.pm-reason-template').options[1].textContent, 'Тестовая подпись');
+      assert.equal(s.q('.pm-reason-template').options[1].title, 'TEST_FULL_MESSAGE');
+      s.change(s.q('.pm-reason-template'), '0');
+      assert.equal(s.q('.pm-modal-reason').value, 'TEST_FULL_MESSAGE');
+      s.q('.pm-modal-reason').value += ' EDIT';
+      s.q('.pm-modal-submit').click(); await settle();
+      assert.equal(s.requests[0].body.get('message'), 'TEST_FULL_MESSAGE EDIT');
+    } finally { s.dom.window.close(); }
+  });
+}

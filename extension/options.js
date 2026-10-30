@@ -21,7 +21,7 @@ chrome.storage.local.get(['urlPatterns', 'declineReasons'], (r) => {
     return;
   }
   document.getElementById('url-patterns').value = (r.urlPatterns || []).join('\n');
-  reasonsEl.value = PM_REASONS.read(r.declineReasons).join('\n');
+  reasonsEl.value = PM_REASONS.format(r.declineReasons);
   updateReasonCount();
   settingsLoaded = true;
   saveBtn.disabled = false;
@@ -36,7 +36,9 @@ document.getElementById('save-btn').addEventListener('click', () => {
   const patterns = document.getElementById('url-patterns').value
     .split('\n').map(l => l.trim()).filter(Boolean);
 
-  const declineReasons = PM_REASONS.parse(reasonsEl.value);
+  let declineReasons;
+  try { declineReasons = PM_REASONS.parse(reasonsEl.value); }
+  catch (e) { setStatus(e.message, false); return; }
   saveBtn.disabled = true;
   chrome.storage.local.set({ urlPatterns: patterns, declineReasons }, () => {
     saveBtn.disabled = false;
@@ -50,7 +52,9 @@ document.getElementById('save-btn').addEventListener('click', () => {
 });
 
 function updateReasonCount() {
-  document.getElementById('reason-count').textContent = `Причин: ${PM_REASONS.parse(reasonsEl.value).length}`;
+  try {
+    document.getElementById('reason-count').textContent = `Причин: ${PM_REASONS.parse(reasonsEl.value).length}`;
+  } catch (_) { document.getElementById('reason-count').textContent = 'Проверьте формат строк'; }
 }
 
 reasonsEl.addEventListener('input', () => {
@@ -76,7 +80,7 @@ fileEl.addEventListener('change', async () => {
       reader.readAsText(file, 'UTF-8');
     });
     const reasons = PM_REASONS.parse(text);
-    reasonsEl.value = reasons.join('\n');
+    reasonsEl.value = PM_REASONS.format(reasons);
     updateReasonCount();
     reasonStatusEl.textContent = `Загружено причин: ${reasons.length}. Нажмите «Сохранить».`;
   } catch (e) {

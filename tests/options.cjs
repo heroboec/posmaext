@@ -8,7 +8,7 @@ function setup(initial = {}) {
   const dom = new JSDOM(read('options.html'), { runScripts: 'outside-only' });
   const w = dom.window, data = { ...initial }, writes = [];
   w.chrome = {
-    runtime: { getManifest: () => ({ version: '2.15' }), reload() {} },
+    runtime: { getManifest: () => ({ version: '2.16' }), reload() {} },
     storage: { local: {
       remove() {}, get: (_, cb) => cb(data),
       set: (value, cb) => { writes.push(value); Object.assign(data, value); cb(); },
@@ -30,7 +30,7 @@ test('options: empty by default; only user-entered reasons are saved', () => {
     s.q('#decline-reasons').dispatchEvent(new s.w.Event('input'));
     assert.equal(s.q('#reason-count').textContent, 'Причин: 2');
     s.q('#save-btn').click();
-    assert.deepEqual(Array.from(s.data.declineReasons), ['First reason', 'Вторая причина с ссылкой https://example.test']);
+    assert.deepEqual(Array.from(s.data.declineReasons, value => value.text), ['First reason', 'Вторая причина с ссылкой https://example.test']);
     assert.deepEqual(Array.from(s.data.urlPatterns), ['/bids']);
     s.q('#decline-reasons').value = ''; s.q('#save-btn').click();
     assert.equal(s.data.declineReasons.length, 0);
@@ -96,6 +96,34 @@ test('TXT roundtrip: synthetic UTF-8 lines import without changing text', async 
     assert.equal(s.q('#decline-reasons').value, lines.join('\n'));
     assert.equal(s.writes.length, 0);
     s.q('#save-btn').click();
-    assert.deepEqual(Array.from(s.data.declineReasons), lines);
+    assert.deepEqual(Array.from(s.data.declineReasons, value => value.text), lines);
+  } finally { s.dom.window.close(); }
+});
+
+test('labels: import two columns, save, reopen and preserve legacy plain messages', async () => {
+  const s = setup({ declineReasons: ['LEGACY | LITERAL_MESSAGE'] });
+  try {
+    assert.equal(s.q('#decline-reasons').value, '\tLEGACY | LITERAL_MESSAGE');
+    s.q('#save-btn').click();
+    assert.equal(s.data.declineReasons[0].label, '');
+    assert.equal(s.data.declineReasons[0].text, 'LEGACY | LITERAL_MESSAGE');
+    const text = 'Тест А\tTEST_MESSAGE_A\r\nТест Б | TEST_MESSAGE_B | PRESERVED\nPLAIN_TEST_MESSAGE\n';
+    const file = new s.w.File([text], 'labels.txt', { type: 'text/plain' });
+    Object.defineProperty(s.q('#reason-file'), 'files', { value: [file] });
+    s.q('#reason-file').dispatchEvent(new s.w.Event('change'));
+    for (let i = 0; i < 100 && s.q('#save-btn').disabled; i++) await new Promise(r => setTimeout(r, 5));
+    s.q('#save-btn').click();
+    assert.deepEqual(JSON.parse(JSON.stringify(s.data.declineReasons)), [
+      { label: 'Тест А', text: 'TEST_MESSAGE_A' },
+      { label: 'Тест Б', text: 'TEST_MESSAGE_B | PRESERVED' },
+      { label: '', text: 'PLAIN_TEST_MESSAGE' },
+    ]);
+    const next = setup(s.data);
+    try { assert.equal(next.q('#decline-reasons').value, 'Тест А\tTEST_MESSAGE_A\nТест Б\tTEST_MESSAGE_B | PRESERVED\nPLAIN_TEST_MESSAGE'); }
+    finally { next.dom.window.close(); }
+    s.q('#decline-reasons').value = 'Тест | ';
+    const writes = s.writes.length; s.q('#save-btn').click();
+    assert.equal(s.writes.length, writes);
+    assert.match(s.q('#status').textContent, /строке 1/);
   } finally { s.dom.window.close(); }
 });

@@ -554,12 +554,12 @@ function pmShowDeclineDialog(bidId, onDone, options = {}) {
     const option = document.createElement('option');
     option.value = String(index);
     option.textContent = PM_REASONS.label(text);
-    option.title = text;
+    option.title = PM_REASONS.text(text);
     template.appendChild(option);
   });
   template.onchange = () => {
     if (template.value === '') return;
-    reason.value = dialogReasons[Number(template.value)];
+    reason.value = PM_REASONS.text(dialogReasons[Number(template.value)]);
     reason.dispatchEvent(new Event('input', { bubbles: true }));
     reason.focus();
   };
