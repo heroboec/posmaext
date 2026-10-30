@@ -82,7 +82,7 @@ test('options: read and storage failures are shown without losing edited text', 
   } finally { s.dom.window.close(); }
 });
 
-test('export: 12 UTF-8 lines import without changing text or URLs', async () => {
+test('TXT roundtrip: synthetic UTF-8 lines import without changing text', async () => {
   const text = Array.from({ length: 12 }, (_, i) => `TEST_MESSAGE_${i + 1}`).join('\n') + '\n';
   const lines = text.trimEnd().split('\n');
   assert.equal(lines.length, 12);

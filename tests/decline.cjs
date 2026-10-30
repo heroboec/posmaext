@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../extension/rejection-reasons.js'), 'utf8') + '\n' +
   fs.readFileSync(path.join(__dirname, '../extension/content.js'), 'utf8');
-// Simulate a user who imported the exported list, not application defaults.
+// Synthetic fixture: never put real user rejection reasons in tests.
 const importedReasons = Array.from({ length: 12 }, (_, i) => `TEST_MESSAGE_${String(i + 1).padStart(2, '0')}`);
 const row = (id, rowClass = 'tr_default') => `<tr class="${rowClass} bids-tr-table-new"><td>
 <select id="status_id${id}" data-current-status="2" onchange="window.nativeChanges++">

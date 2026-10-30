@@ -5,3 +5,7 @@
 
 # IDE
 .idea/
+
+# User rejection lists are private local data
+/exports/
+/rejection-reasons*.txt
