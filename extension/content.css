@@ -89,6 +89,12 @@ tr.pm-hidden-by-filter { display: none !important; }
   font: 14px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 .pm-modal-title { font-weight: 600; font-size: 16px; margin-bottom: 12px; }
+.pm-reason-label { display: block; margin-bottom: 10px; font: inherit; }
+.pm-reason-template {
+  display: block; width: 100%; min-width: 0; box-sizing: border-box;
+  margin-top: 4px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;
+  background: #fff; color: #222; font: inherit;
+}
 .pm-modal-reason {
   width: 100%; box-sizing: border-box; padding: 8px 10px;
   border: 1px solid #ccc; border-radius: 4px; font: inherit; resize: vertical;

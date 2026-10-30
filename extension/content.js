@@ -245,6 +245,45 @@ function pmAddFloatingSave(form) {
 // ── Decline bid from the macro-values page ───────────────────────────────────
 
 const PM_DECLINED_STATUS = '4';
+const PM_DECLINE_REASONS = [];
+
+// Intercept only rejection on bid rows; other statuses retain the site's handler.
+// Capture runs before the select's inline onchange, avoiding a second dialog/request.
+function pmInitListDecline() {
+  const previous = new WeakMap();
+  const isStatus = el => el instanceof HTMLSelectElement &&
+    /^status_id\d+$/.test(el.id) && el.closest('tr.tr_default.bids-tr-table-new');
+  const remember = e => { if (isStatus(e.target)) previous.set(e.target, e.target.value); };
+  document.addEventListener('focusin', remember, true);
+  document.addEventListener('pointerdown', remember, true);
+  document.addEventListener('change', e => {
+    const select = e.target;
+    if (!pmUrlMatches() || pmIsMacroValuesPage() || !isStatus(select)) return;
+    if (select.value !== PM_DECLINED_STATUS) {
+      previous.set(select, select.value);
+      return;
+    }
+    e.stopImmediatePropagation();
+    const oldStatus = previous.get(select) || select.dataset.currentStatus ||
+      [...select.options].find(o => o.defaultSelected)?.value || '';
+    select.value = oldStatus;
+    const bidId = select.id.slice('status_id'.length);
+    pmShowDeclineDialog(bidId, message => {
+      select.value = PM_DECLINED_STATUS;
+      select.dataset.currentStatus = PM_DECLINED_STATUS;
+      previous.set(select, PM_DECLINED_STATUS);
+      const row = select.closest('tr');
+      const reason = row.querySelector(`.bids-edit-reason-${bidId}`);
+      if (reason) {
+        reason.textContent = message;
+        reason.title = message;
+        const section = reason.closest('.bids-section-reason');
+        if (section) section.style.display = '';
+      }
+      pmRenderFilterPanel();
+    });
+  }, true);
+}
 
 function pmGetCsrf() {
   return document.querySelector('meta[name="csrf-token"]')?.content || null;
@@ -285,7 +324,12 @@ function pmShowDeclineDialog(bidId, onDone) {
   backdrop.innerHTML = `
     <div class="pm-modal" role="dialog" aria-modal="true">
       <div class="pm-modal-title"></div>
-      <textarea class="pm-modal-reason" rows="5" placeholder="Причина отклонения (увидит партнёр)"></textarea>
+      <label class="pm-reason-label">Шаблон причины
+        <select class="pm-reason-template"><option value="">Выберите шаблон (необязательно)</option></select>
+      </label>
+      <label class="pm-reason-label">Причина отклонения (увидит партнёр)
+        <textarea class="pm-modal-reason" rows="5" placeholder="Выберите шаблон выше или напишите причину вручную"></textarea>
+      </label>
       <div class="pm-modal-error"></div>
       <div class="pm-modal-actions">
         <button type="button" class="pm-modal-cancel">Отмена</button>
@@ -294,24 +338,38 @@ function pmShowDeclineDialog(bidId, onDone) {
     </div>`;
   backdrop.querySelector('.pm-modal-title').textContent = `Отклонить заявку #${bidId}`;
   const reason = backdrop.querySelector('.pm-modal-reason');
+  const template = backdrop.querySelector('.pm-reason-template');
+  PM_DECLINE_REASONS.forEach((text, index) => {
+    const option = document.createElement('option');
+    option.value = String(index);
+    option.textContent = text;
+    template.appendChild(option);
+  });
+  template.onchange = () => {
+    if (template.value === '') return;
+    reason.value = PM_DECLINE_REASONS[Number(template.value)];
+    reason.dispatchEvent(new Event('input', { bubbles: true }));
+    reason.focus();
+  };
   const errorEl = backdrop.querySelector('.pm-modal-error');
   const submit = backdrop.querySelector('.pm-modal-submit');
   const cancel = backdrop.querySelector('.pm-modal-cancel');
   const close = () => backdrop.remove();
 
   const doSubmit = async () => {
+    if (submit.disabled) return;
     const message = reason.value.trim();
     if (!message) { errorEl.textContent = 'Укажите причину'; reason.focus(); return; }
     errorEl.textContent = '';
-    submit.disabled = cancel.disabled = reason.disabled = true;
+    submit.disabled = cancel.disabled = reason.disabled = template.disabled = true;
     submit.textContent = 'Отправляю…';
     try {
       await pmDeclineBid(bidId, message);
       close();
-      onDone();
+      onDone(message);
     } catch (e) {
       errorEl.textContent = `✗ Не удалось: ${e.message}`;
-      submit.disabled = cancel.disabled = reason.disabled = false;
+      submit.disabled = cancel.disabled = reason.disabled = template.disabled = false;
       submit.textContent = 'Отклонить';
     }
   };
@@ -351,6 +409,7 @@ function pmInitMacroValuesPage() {
 }
 
 pmInitMacroValuesPage();
+pmInitListDecline();
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
