@@ -4,14 +4,28 @@ const statusEl = document.getElementById('status');
 const GITHUB_REPO = 'heroboec/posmaext';
 const resultEl = document.getElementById('update-result');
 const currentVersion = chrome.runtime.getManifest().version;
+const reasonsEl = document.getElementById('decline-reasons');
+const saveBtn = document.getElementById('save-btn');
+const reasonStatusEl = document.getElementById('reason-status');
+const fileEl = document.getElementById('reason-file');
+const restoreBtn = document.getElementById('restore-reasons');
+let settingsLoaded = false;
 
 document.getElementById('current-version').textContent = currentVersion;
 
 // Same cleanup as in background.js, in case the worker hasn't run onInstalled yet.
 chrome.storage.local.remove(['csvData', 'savedMatches', 'appliedBids', 'catalogUrls', 'invalidThreshold', 'githubRepo']);
 
-chrome.storage.local.get(['urlPatterns'], (r) => {
+chrome.storage.local.get(['urlPatterns', 'declineReasons'], (r) => {
+  if (chrome.runtime.lastError) {
+    setStatus(`Не удалось загрузить настройки: ${chrome.runtime.lastError.message}`, false);
+    return;
+  }
   document.getElementById('url-patterns').value = (r.urlPatterns || []).join('\n');
+  reasonsEl.value = PM_REASONS.read(r.declineReasons).join('\n');
+  updateReasonCount();
+  settingsLoaded = true;
+  saveBtn.disabled = false;
 });
 
 function setStatus(msg, ok) {
@@ -23,13 +37,62 @@ document.getElementById('save-btn').addEventListener('click', () => {
   const patterns = document.getElementById('url-patterns').value
     .split('\n').map(l => l.trim()).filter(Boolean);
 
-  chrome.storage.local.set({ urlPatterns: patterns }, () => {
+  const declineReasons = PM_REASONS.parse(reasonsEl.value);
+  saveBtn.disabled = true;
+  chrome.storage.local.set({ urlPatterns: patterns, declineReasons }, () => {
+    saveBtn.disabled = false;
     if (chrome.runtime.lastError) {
       setStatus(`Ошибка хранилища: ${chrome.runtime.lastError.message}`, false);
       return;
     }
-    setStatus(`✓ Сохранено (паттернов: ${patterns.length})`, true);
+    reasonStatusEl.textContent = '';
+    setStatus(`✓ Сохранено: паттернов — ${patterns.length}, причин — ${declineReasons.length}. Причины доступны при следующем открытии окна отклонения.`, true);
   });
+});
+
+function updateReasonCount() {
+  document.getElementById('reason-count').textContent = `Причин: ${PM_REASONS.parse(reasonsEl.value).length}`;
+}
+
+reasonsEl.addEventListener('input', () => {
+  updateReasonCount();
+  statusEl.textContent = '';
+  reasonStatusEl.className = '';
+  reasonStatusEl.textContent = 'Изменения не сохранены.';
+});
+
+restoreBtn.addEventListener('click', () => {
+  reasonsEl.value = PM_REASONS.defaults.join('\n');
+  reasonsEl.dispatchEvent(new Event('input'));
+});
+
+fileEl.addEventListener('change', async () => {
+  const file = fileEl.files[0];
+  if (!file) return;
+  saveBtn.disabled = reasonsEl.disabled = fileEl.disabled = restoreBtn.disabled = true;
+  reasonStatusEl.className = '';
+  reasonStatusEl.textContent = 'Загружаю файл…';
+  statusEl.textContent = '';
+  try {
+    const text = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error('Не удалось прочитать файл'));
+      reader.onabort = () => reject(new Error('Чтение файла отменено'));
+      reader.readAsText(file, 'UTF-8');
+    });
+    const reasons = PM_REASONS.parse(text);
+    reasonsEl.value = reasons.join('\n');
+    updateReasonCount();
+    reasonStatusEl.textContent = `Загружено причин: ${reasons.length}. Нажмите «Сохранить».`;
+  } catch (e) {
+    reasonStatusEl.className = 'err';
+    reasonStatusEl.textContent = e.message;
+  } finally {
+    reasonsEl.disabled = fileEl.disabled = restoreBtn.disabled = false;
+    saveBtn.disabled = !settingsLoaded;
+    fileEl.value = '';
+  }
 });
 
 // ── Updates ───────────────────────────────────────────────────────────────────

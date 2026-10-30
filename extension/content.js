@@ -251,9 +251,7 @@ function pmAddFloatingSave(form) {
 // ── Decline bid from the macro-values page ───────────────────────────────────
 
 const PM_DECLINED_STATUS = '4';
-const PM_DECLINE_REASONS = [];
-
-const PM_DECLINE_LABELS = [];
+let pmDeclineReasons = [...PM_REASONS.defaults];
 
 // Shadow DOM keeps the site's form styles out of the rejection dialog.
 const PM_DECLINE_DIALOG_CSS = `
@@ -551,16 +549,17 @@ function pmShowDeclineDialog(bidId, onDone, options = {}) {
   root.querySelector('.pm-modal-summary').textContent = options.summary || '';
   const reason = root.querySelector('.pm-modal-reason');
   const template = root.querySelector('.pm-reason-template');
-  PM_DECLINE_REASONS.forEach((text, index) => {
+  const dialogReasons = [...pmDeclineReasons]; // Keep this open dialog stable while settings change.
+  PM_REASONS.read(dialogReasons).forEach((text, index) => {
     const option = document.createElement('option');
     option.value = String(index);
-    option.textContent = PM_DECLINE_LABELS[index];
+    option.textContent = PM_REASONS.label(text);
     option.title = text;
     template.appendChild(option);
   });
   template.onchange = () => {
     if (template.value === '') return;
-    reason.value = PM_DECLINE_REASONS[Number(template.value)];
+    reason.value = dialogReasons[Number(template.value)];
     reason.dispatchEvent(new Event('input', { bubbles: true }));
     reason.focus();
   };
@@ -659,13 +658,17 @@ function pmStart() {
   pmObserver.observe(document.body, { childList: true, subtree: true });
 }
 
-chrome.storage.local.get(['urlPatterns'], (r) => {
+chrome.storage.local.get(['urlPatterns', 'declineReasons'], (r) => {
+  pmDeclineReasons = PM_REASONS.read(r.declineReasons);
   pmUrlPatterns = r.urlPatterns || [];
   pmStart();
 });
 
-chrome.storage.onChanged.addListener((changes) => {
-  if (!changes.urlPatterns) return;
-  pmUrlPatterns = changes.urlPatterns.newValue || [];
-  pmStart();
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName && areaName !== 'local') return;
+  if (changes.declineReasons) pmDeclineReasons = PM_REASONS.read(changes.declineReasons.newValue);
+  if (changes.urlPatterns) {
+    pmUrlPatterns = changes.urlPatterns.newValue || [];
+    pmStart();
+  }
 });

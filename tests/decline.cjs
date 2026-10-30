@@ -3,13 +3,14 @@ const assert = require('node:assert/strict');
 const { JSDOM } = require('jsdom');
 const fs = require('node:fs');
 const path = require('node:path');
-const source = fs.readFileSync(path.join(__dirname, '../extension/content.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '../extension/rejection-reasons.js'), 'utf8') + '\n' +
+  fs.readFileSync(path.join(__dirname, '../extension/content.js'), 'utf8');
 const row = (id, rowClass = 'tr_default') => `<tr class="${rowClass} bids-tr-table-new"><td>
 <select id="status_id${id}" data-current-status="2" onchange="window.nativeChanges++">
 <option value="2" selected>Review</option><option value="3">Sale</option><option value="4">Declined</option></select>
 <div class="bids-section-reason" style="display:none"><span class="bids-edit-reason-${id}"></span></div>
 </td></tr>`;
-function setup(macro = false, patterns = ['/bids'], count = 1, rowClasses = []) {
+function setup(macro = false, patterns = ['/bids'], count = 1, rowClasses = [], declineReasons) {
   const dom = new JSDOM(`<meta name="csrf-token" content="test-token">${macro ?
     '<form id="bid-macro-values-edit-form" action="/bids/macro-values-save/42"><button type="submit">Save</button></form>' :
     `<table><tbody>${Array.from({length: count}, (_, i) => row(42 + i, rowClasses[i])).join('')}</tbody></table>`}`, {
@@ -17,7 +18,9 @@ function setup(macro = false, patterns = ['/bids'], count = 1, rowClasses = []) 
   });
   const w = dom.window;
   w.nativeChanges = 0;
-  w.chrome = { storage: { local: { get: (_, cb) => cb({ urlPatterns: patterns }) }, onChanged: { addListener() {} } } };
+  w.chrome = { storage: { local: { get: (_, cb) => cb({ urlPatterns: patterns, declineReasons }) }, onChanged: { addListener() {} } } };
+  const storageListeners = [];
+  w.chrome.storage.onChanged.addListener = cb => storageListeners.push(cb);
   const requests = [];
   w.fetch = async (url, opts) => {
     requests.push({ url, body: new URLSearchParams(opts.body.toString()) });
@@ -27,7 +30,7 @@ function setup(macro = false, patterns = ['/bids'], count = 1, rowClasses = []) 
   const q = s => w.document.querySelector(s) || w.document.querySelector('.pm-modal-backdrop')?.shadowRoot.querySelector(s) || w.document.querySelector('.pm-selection-toolbar')?.shadowRoot.querySelector(s) || null;
   const change = (el, value) => { el.value = value; el.dispatchEvent(new w.Event('change', { bubbles: true })); };
   const open = () => macro ? q('.pm-float-decline').click() : change(q('#status_id42'), '4');
-  return { dom, w, q, change, open, requests };
+  return { dom, w, q, change, open, requests, storageListeners };
 }
 const settle = () => new Promise(r => setImmediate(r));
 for (const macro of [false, true]) {
@@ -275,5 +278,56 @@ test('all bid row styles: checkboxes, filters, detail expansion, batch links and
     assert.equal(s.q('#status_id43').value, '4');
     assert.equal(s.q('#status_id43').closest('tr').querySelector('.pm-bid-select').disabled, true);
     assert.equal(s.q('#status_id44').value, '2');
+  } finally { s.dom.window.close(); }
+});
+
+for (const macro of [false, true]) {
+  test(`${macro ? 'edit' : 'list'}: saved custom reasons are editable and sent`, async () => {
+    const s = setup(macro, ['/bids'], 1, [], ['Custom reason one', 'Вторая причина https://example.test/help']);
+    try {
+      s.open();
+      assert.equal(s.q('.pm-reason-template').options.length, 3);
+      s.change(s.q('.pm-reason-template'), '1');
+      assert.equal(s.q('.pm-modal-reason').value, 'Вторая причина https://example.test/help');
+      s.q('.pm-modal-reason').value += ' — уточнение';
+      s.q('.pm-modal-submit').click(); await settle();
+      assert.equal(s.requests[0].body.get('message'), 'Вторая причина https://example.test/help — уточнение');
+    } finally { s.dom.window.close(); }
+  });
+}
+
+test('settings updates: open dialog keeps its draft and template mapping; next dialog uses new list', () => {
+  const s = setup(true);
+  try {
+    s.open(); s.q('.pm-modal-reason').value = 'Draft';
+    s.storageListeners.forEach(cb => cb({ declineReasons: { newValue: ['New reason'] } }, 'local'));
+    assert.equal(s.q('.pm-modal-reason').value, 'Draft');
+    s.change(s.q('.pm-reason-template'), '0');
+    assert.equal(s.q('.pm-modal-reason').value, 'TEST_MESSAGE_01');
+    s.q('.pm-modal-cancel').click(); s.open();
+    assert.equal(s.q('.pm-reason-template').options.length, 2);
+    s.change(s.q('.pm-reason-template'), '0');
+    assert.equal(s.q('.pm-modal-reason').value, 'New reason');
+    s.q('.pm-modal-cancel').click();
+    s.storageListeners.forEach(cb => cb({ declineReasons: { newValue: [] } }, 'local'));
+    s.open(); assert.equal(s.q('.pm-reason-template').options.length, 1);
+    s.q('.pm-modal-cancel').click();
+    s.storageListeners.forEach(cb => cb({ declineReasons: {} }, 'local'));
+    s.open(); assert.equal(s.q('.pm-reason-template').options.length, 13);
+  } finally { s.dom.window.close(); }
+});
+
+test('selected batch uses the updated custom reason', async () => {
+  const s = setup(false, [], 2);
+  try {
+    const timeout = s.w.setTimeout.bind(s.w);
+    s.w.setTimeout = (fn, ms, ...args) => timeout(fn, ms === 800 ? 1 : ms, ...args);
+    s.storageListeners.forEach(cb => cb({ declineReasons: { newValue: ['Shared custom reason'] } }, 'local'));
+    s.q('.pm-selection-all').click(); s.q('.pm-selection-decline').click();
+    s.change(s.q('.pm-reason-template'), '0');
+    s.q('.pm-modal-submit').click();
+    for (let i = 0; i < 100 && s.q('.pm-modal-backdrop'); i++) await new Promise(r => setTimeout(r, 5));
+    assert.equal(s.requests.length, 2);
+    assert.ok(s.requests.every(r => r.body.get('message') === 'Shared custom reason'));
   } finally { s.dom.window.close(); }
 });
