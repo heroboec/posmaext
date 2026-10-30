@@ -8,7 +8,7 @@ function setup(initial = {}) {
   const dom = new JSDOM(read('options.html'), { runScripts: 'outside-only' });
   const w = dom.window, data = { ...initial }, writes = [];
   w.chrome = {
-    runtime: { getManifest: () => ({ version: '2.14' }), reload() {} },
+    runtime: { getManifest: () => ({ version: '2.15' }), reload() {} },
     storage: { local: {
       remove() {}, get: (_, cb) => cb(data),
       set: (value, cb) => { writes.push(value); Object.assign(data, value); cb(); },
