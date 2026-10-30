@@ -553,8 +553,8 @@ function pmShowDeclineDialog(bidId, onDone, options = {}) {
   PM_REASONS.read(dialogReasons).forEach((text, index) => {
     const option = document.createElement('option');
     option.value = String(index);
-    option.textContent = PM_REASONS.label(text);
-    option.title = PM_REASONS.text(text);
+    option.textContent = PM_REASONS.label(text, index);
+    option.title = option.textContent;
     template.appendChild(option);
   });
   template.onchange = () => {

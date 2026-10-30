@@ -42,7 +42,7 @@ for (const macro of [false, true]) {
       s.open();
       assert.equal(s.requests.length, 0);
       assert.equal(s.q('.pm-reason-template').options.length, 13);
-      assert.equal(s.q('.pm-reason-template').options[12].title, "TEST_MESSAGE_12");
+      assert.equal(s.q('.pm-reason-template').options[12].title, "Причина 12");
       s.change(s.q('.pm-reason-template'), '7');
       assert.equal(s.q('.pm-modal-reason').value, 'TEST_MESSAGE_08');
       s.q('.pm-modal-reason').value += ' Edited by operator.';
@@ -351,7 +351,7 @@ for (const macro of [false, true]) {
     try {
       s.open();
       assert.equal(s.q('.pm-reason-template').options[1].textContent, 'Тестовая подпись');
-      assert.equal(s.q('.pm-reason-template').options[1].title, 'TEST_FULL_MESSAGE');
+      assert.equal(s.q('.pm-reason-template').options[1].title, 'Тестовая подпись');
       s.change(s.q('.pm-reason-template'), '0');
       assert.equal(s.q('.pm-modal-reason').value, 'TEST_FULL_MESSAGE');
       s.q('.pm-modal-reason').value += ' EDIT';
@@ -360,3 +360,39 @@ for (const macro of [false, true]) {
     } finally { s.dom.window.close(); }
   });
 }
+
+for (const macro of [false, true]) {
+  test(`${macro ? 'edit' : 'list'}: legacy stored lines and unlabeled objects separate label from body`, async () => {
+    for (const stored of [
+      'Тестовая подпись\tTEST_LEGACY_BODY',
+      'Тестовая подпись | TEST_LEGACY_BODY',
+      { label: '', text: 'Тестовая подпись\tTEST_LEGACY_BODY' },
+      { label: '', text: 'Тестовая подпись | TEST_LEGACY_BODY' },
+    ]) {
+      const s = setup(macro, ['/bids'], 1, [], [stored]);
+      try {
+        s.open();
+        const option = s.q('.pm-reason-template').options[1];
+        assert.equal(option.textContent, 'Тестовая подпись');
+        assert.equal(option.title, 'Тестовая подпись');
+        s.change(s.q('.pm-reason-template'), '0');
+        assert.equal(s.q('.pm-modal-reason').value, 'TEST_LEGACY_BODY');
+        s.q('.pm-modal-submit').click(); await settle();
+        assert.equal(s.requests[0].body.get('message'), 'TEST_LEGACY_BODY');
+      } finally { s.dom.window.close(); }
+    }
+  });
+}
+
+test('unlabeled messages: dropdown never exposes body text', () => {
+  const s = setup(true, [], 1, [], ['TEST_PRIVATE_BODY_A', 'TEST_PRIVATE_BODY_B']);
+  try {
+    s.open();
+    const options = s.q('.pm-reason-template').options;
+    assert.equal(options[1].textContent, 'Причина 1');
+    assert.equal(options[2].textContent, 'Причина 2');
+    assert.equal(options[2].title, 'Причина 2');
+    s.change(s.q('.pm-reason-template'), '1');
+    assert.equal(s.q('.pm-modal-reason').value, 'TEST_PRIVATE_BODY_B');
+  } finally { s.dom.window.close(); }
+});

@@ -8,7 +8,7 @@ function setup(initial = {}) {
   const dom = new JSDOM(read('options.html'), { runScripts: 'outside-only' });
   const w = dom.window, data = { ...initial }, writes = [];
   w.chrome = {
-    runtime: { getManifest: () => ({ version: '2.16' }), reload() {} },
+    runtime: { getManifest: () => ({ version: '2.17' }), reload() {} },
     storage: { local: {
       remove() {}, get: (_, cb) => cb(data),
       set: (value, cb) => { writes.push(value); Object.assign(data, value); cb(); },
@@ -100,13 +100,13 @@ test('TXT roundtrip: synthetic UTF-8 lines import without changing text', async 
   } finally { s.dom.window.close(); }
 });
 
-test('labels: import two columns, save, reopen and preserve legacy plain messages', async () => {
+test('labels: migrate legacy two-column lines, import, save and reopen', async () => {
   const s = setup({ declineReasons: ['LEGACY | LITERAL_MESSAGE'] });
   try {
-    assert.equal(s.q('#decline-reasons').value, '\tLEGACY | LITERAL_MESSAGE');
+    assert.equal(s.q('#decline-reasons').value, 'LEGACY\tLITERAL_MESSAGE');
     s.q('#save-btn').click();
-    assert.equal(s.data.declineReasons[0].label, '');
-    assert.equal(s.data.declineReasons[0].text, 'LEGACY | LITERAL_MESSAGE');
+    assert.equal(s.data.declineReasons[0].label, 'LEGACY');
+    assert.equal(s.data.declineReasons[0].text, 'LITERAL_MESSAGE');
     const text = 'Тест А\tTEST_MESSAGE_A\r\nТест Б | TEST_MESSAGE_B | PRESERVED\nPLAIN_TEST_MESSAGE\n';
     const file = new s.w.File([text], 'labels.txt', { type: 'text/plain' });
     Object.defineProperty(s.q('#reason-file'), 'files', { value: [file] });
@@ -114,9 +114,9 @@ test('labels: import two columns, save, reopen and preserve legacy plain message
     for (let i = 0; i < 100 && s.q('#save-btn').disabled; i++) await new Promise(r => setTimeout(r, 5));
     s.q('#save-btn').click();
     assert.deepEqual(JSON.parse(JSON.stringify(s.data.declineReasons)), [
-      { label: 'Тест А', text: 'TEST_MESSAGE_A' },
-      { label: 'Тест Б', text: 'TEST_MESSAGE_B | PRESERVED' },
-      { label: '', text: 'PLAIN_TEST_MESSAGE' },
+      { label: 'Тест А', text: 'TEST_MESSAGE_A', formatVersion: 1 },
+      { label: 'Тест Б', text: 'TEST_MESSAGE_B | PRESERVED', formatVersion: 1 },
+      { label: '', text: 'PLAIN_TEST_MESSAGE', formatVersion: 1 },
     ]);
     const next = setup(s.data);
     try { assert.equal(next.q('#decline-reasons').value, 'Тест А\tTEST_MESSAGE_A\nТест Б\tTEST_MESSAGE_B | PRESERVED\nPLAIN_TEST_MESSAGE'); }
@@ -125,5 +125,21 @@ test('labels: import two columns, save, reopen and preserve legacy plain message
     const writes = s.writes.length; s.q('#save-btn').click();
     assert.equal(s.writes.length, writes);
     assert.match(s.q('#status').textContent, /строке 1/);
+  } finally { s.dom.window.close(); }
+});
+
+test('explicit literal body separators survive saving and reopening', () => {
+  const s = setup();
+  try {
+    s.q('#decline-reasons').value = '\tTEST_BODY | EXTRA\nТест\tTEST_BODY\tEXTRA';
+    s.q('#save-btn').click();
+    const next = setup(s.data);
+    try {
+      next.q('#save-btn').click();
+      assert.equal(next.data.declineReasons[0].label, '');
+      assert.equal(next.data.declineReasons[0].text, 'TEST_BODY | EXTRA');
+      assert.equal(next.data.declineReasons[1].label, 'Тест');
+      assert.equal(next.data.declineReasons[1].text, 'TEST_BODY\tEXTRA');
+    } finally { next.dom.window.close(); }
   } finally { s.dom.window.close(); }
 });
