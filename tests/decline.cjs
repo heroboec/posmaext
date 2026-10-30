@@ -4,15 +4,15 @@ const { JSDOM } = require('jsdom');
 const fs = require('node:fs');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../extension/content.js'), 'utf8');
-const row = id => `<tr class="tr_default bids-tr-table-new"><td>
+const row = (id, rowClass = 'tr_default') => `<tr class="${rowClass} bids-tr-table-new"><td>
 <select id="status_id${id}" data-current-status="2" onchange="window.nativeChanges++">
 <option value="2" selected>Review</option><option value="3">Sale</option><option value="4">Declined</option></select>
 <div class="bids-section-reason" style="display:none"><span class="bids-edit-reason-${id}"></span></div>
 </td></tr>`;
-function setup(macro = false, patterns = ['/bids'], count = 1) {
+function setup(macro = false, patterns = ['/bids'], count = 1, rowClasses = []) {
   const dom = new JSDOM(`<meta name="csrf-token" content="test-token">${macro ?
     '<form id="bid-macro-values-edit-form" action="/bids/macro-values-save/42"><button type="submit">Save</button></form>' :
-    `<table><tbody>${Array.from({length: count}, (_, i) => row(42 + i)).join('')}</tbody></table>`}`, {
+    `<table><tbody>${Array.from({length: count}, (_, i) => row(42 + i, rowClasses[i])).join('')}</tbody></table>`}`, {
     url: `https://example.test/bids/${macro ? 'macro-values/42' : 'list'}`, runScripts: 'dangerously',
   });
   const w = dom.window;
@@ -241,5 +241,39 @@ test('selected batch: cancellation sends nothing; hidden and removed rows are de
     s.q('tbody').insertAdjacentHTML('beforeend', row(45)); await new Promise(r => setTimeout(r, 180));
     assert.equal(s.w.document.querySelectorAll('.pm-bid-select').length, 3);
     assert.equal(s.q('#status_id45').closest('tr').querySelector('.pm-bid-select').checked, false);
+  } finally { s.dom.window.close(); }
+});
+
+test('all bid row styles: checkboxes, filters, detail expansion, batch links and rejection', async () => {
+  const s = setup(false, ['/bids'], 3, ['tr_default', 'tr_saled', '']);
+  try {
+    assert.equal(s.w.document.querySelectorAll('.pm-bid-select').length, 3);
+    for (const id of [42, 43, 44]) {
+      const tr = s.q(`#status_id${id}`).closest('tr');
+      tr.cells[0].insertAdjacentHTML('beforeend', `<div data-section-category="${id}"><span>${id === 42 ? 'Other' : 'Facebook'}</span></div>
+        <a data-bid-id-show-section="${id}"></a><a class="bid-macro-values-edit-outside-link" href="/bids/macro-values/${id}"></a>`);
+      tr.insertAdjacentHTML('afterend', '<tr class="tr-hidden-bid" style="display:none"><td>Details</td></tr>');
+    }
+    await new Promise(r => setTimeout(r, 180));
+    assert.equal(s.q('.pm-filter-open-btn').textContent, '↗ Править значения (3)');
+    assert.equal(s.q('.pm-filter-sale-btn').textContent, '🛒 В продаже (3)');
+    const facebook = [...s.w.document.querySelectorAll('.pm-filter-btn')].find(b => b.textContent === 'Facebook');
+    assert.ok(facebook); facebook.click();
+    assert.equal(s.q('.pm-filter-open-btn').textContent, '↗ Править значения (2)');
+    assert.equal(s.q('.pm-filter-sale-btn').textContent, '🛒 В продаже (2)');
+    assert.equal(s.q('#status_id42').closest('tr').classList.contains('pm-hidden-by-filter'), true);
+    assert.equal(s.q('#status_id43').closest('tr').classList.contains('pm-hidden-by-filter'), false);
+    s.q('.pm-filter-expand-btn').click();
+    assert.equal(s.q('#status_id43').closest('tr').nextElementSibling.style.display, 'table-row');
+    s.q('#status_id43').closest('tr').querySelector('.pm-bid-select').click();
+    s.q('.pm-selection-decline').click();
+    assert.equal(s.q('.pm-modal-summary').textContent, '#43');
+    s.q('.pm-modal-reason').value = 'Test reason for a tr_saled row';
+    s.q('.pm-modal-submit').click(); await settle();
+    assert.equal(s.requests.length, 1);
+    assert.equal(s.requests[0].body.get('bid_id'), '43');
+    assert.equal(s.q('#status_id43').value, '4');
+    assert.equal(s.q('#status_id43').closest('tr').querySelector('.pm-bid-select').disabled, true);
+    assert.equal(s.q('#status_id44').value, '2');
   } finally { s.dom.window.close(); }
 });

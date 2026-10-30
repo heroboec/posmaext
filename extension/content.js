@@ -25,7 +25,7 @@ function pmGetRowCategory(tr) {
 }
 
 function pmApplyFilter() {
-  document.querySelectorAll('tr.tr_default.bids-tr-table-new').forEach(tr => {
+  document.querySelectorAll('tr.bids-tr-table-new').forEach(tr => {
     let hide = false;
     if (pmActiveFilters.size) {
       const cat = pmGetRowCategory(tr);
@@ -42,7 +42,7 @@ function pmApplyFilter() {
 
 function pmToggleAllDetails() {
   pmAllExpanded = !pmAllExpanded;
-  document.querySelectorAll('tr.tr_default.bids-tr-table-new:not(.pm-hidden-by-filter)').forEach(tr => {
+  document.querySelectorAll('tr.bids-tr-table-new:not(.pm-hidden-by-filter)').forEach(tr => {
     const hiddenRow = tr.nextElementSibling;
     if (!hiddenRow?.classList.contains('tr-hidden-bid')) return;
     const isShown = getComputedStyle(hiddenRow).display !== 'none';
@@ -70,7 +70,7 @@ let   pmBusy = null; // null = idle, otherwise { kind: 'open' | 'sale', progress
 
 function pmGetBatch() {
   const batch = [];
-  for (const tr of document.querySelectorAll('tr.tr_default.bids-tr-table-new:not(.pm-hidden-by-filter)')) {
+  for (const tr of document.querySelectorAll('tr.bids-tr-table-new:not(.pm-hidden-by-filter)')) {
     const bidId = tr.querySelector('a[data-bid-id-show-section]')?.getAttribute('data-bid-id-show-section');
     if (!bidId) continue;
     batch.push({
@@ -201,7 +201,7 @@ function pmRenderFilterPanel() {
 
 function pmUpdateFilterPanel() {
   let changed = !document.querySelector('.pm-filter-panel');
-  document.querySelectorAll('tr.tr_default.bids-tr-table-new').forEach(tr => {
+  document.querySelectorAll('tr.bids-tr-table-new').forEach(tr => {
     const cat = pmGetRowCategory(tr);
     if (cat && !pmKnownCats.has(cat.name)) {
       pmKnownCats.set(cat.name, cat);
@@ -299,7 +299,7 @@ function pmInitListDecline() {
   const previous = pmPreviousStatus;
   const isStatus = el => el instanceof HTMLSelectElement &&
     /^status_id\d+$/.test(el.id) &&
-    (el.hasAttribute('data-current-status') || el.closest('tr.tr_default.bids-tr-table-new'));
+    (el.hasAttribute('data-current-status') || el.closest('tr.bids-tr-table-new'));
   const enabled = () => !pmIsMacroValuesPage() &&
     (pmUrlMatches() || /^\/(?:[a-z]{2}\/?)?bids(?:\/|$)/i.test(location.pathname));
   const remember = e => { if (isStatus(e.target)) previous.set(e.target, e.target.value); };
@@ -342,7 +342,7 @@ function pmListEnabled() {
 }
 
 function pmSelectableRows() {
-  return [...document.querySelectorAll('tr.tr_default.bids-tr-table-new')].flatMap(row => {
+  return [...document.querySelectorAll('tr.bids-tr-table-new')].flatMap(row => {
     const select = row.querySelector('select[id^="status_id"]');
     const bidId = select?.id.match(/^status_id(\d+)$/)?.[1];
     if (!bidId) return [];

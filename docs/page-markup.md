@@ -6,7 +6,10 @@
 
 ## Список
 
-- Основная строка: `tr.tr_default.bids-tr-table-new`.
+- Основная строка: `tr.bids-tr-table-new`. Дополнительный класс может быть
+  `tr_default`, `tr_saled` или другим: он не определяет текущий статус.
+  В примере пользователя `tr_saled` сочетался со статусом 2 («На проверке»).
+  Текущий статус брать из select, не из CSS-класса строки.
 - Детали: следующая строка `tr.tr-hidden-bid.tr-hidden-bid-{id}`.
 - Категория: `div[data-section-category]`, внутри span с названием и img с иконкой.
 - ID/раскрытие: `a[data-bid-id-show-section]`.
