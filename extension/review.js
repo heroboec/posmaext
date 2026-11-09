@@ -50,18 +50,16 @@ function scReviewRender() {
       if (job.check?.previously_requested !== null && job.check?.previously_requested !== undefined) scNode('p', `Запрашивался ранее: ${job.check.previously_requested ? 'Да' : 'Нет'}`, card);
       if (job.check?.result?.source_observed_at) scNode('p', `Данные источника: ${job.check.result.source_observed_at}`, card);
       if (job.error) scNode('p', job.error, card).className = 'error';
-      scNode('h4', 'Сравнение с описанием поставщика', card);
+      scNode('h4', 'Данные аккаунта', card);
       const scroll = scNode('div', undefined, card); scroll.className = 'scroll';
       const table = scNode('table', undefined, scroll), head = scNode('tr', undefined, scNode('thead', undefined, table));
-      ['Свойство', 'Заявлено поставщиком', 'Данные аккаунта'].forEach(t => scNode('th', t, head));
+      ['Свойство', 'Данные аккаунта'].forEach(t => scNode('th', t, head));
       const body = scNode('tbody', undefined, table);
-      // Both accounts use supplier claims independently, never each other's results.
-      // Only exact, unique labels are matched. Everything else remains below verbatim.
+      // Each account has its own results; supplier properties remain separate below.
       for (const [field, label] of Object.entries(PM_SOCIAL.fields)) {
-        const matching = entry.properties.filter(p => p.label.replace(/:$/, '').trim().toLocaleLowerCase('ru') === label.toLocaleLowerCase('ru'));
-        const property = matching.length === 1 ? matching[0] : null;
+        if (['avatar_url', 'profile_url', 'display_name', 'username', 'bio'].includes(field)) continue;
         const tr = scNode('tr', undefined, body);
-        [label, property ? property.value : 'Не сопоставлено', scValue(job.check?.result?.data?.[field])].forEach(v => scNode('td', v, tr));
+        [label, scValue(job.check?.result?.data?.[field])].forEach(v => scNode('td', v, tr));
       }
     });
     scNode('h3', 'Исходные свойства поставщика', article);
@@ -97,13 +95,17 @@ async function scReviewQueue(action) {
   if (scReviewStop) scReviewConnect();
   scReviewBusy = true; scReviewStop = false; scReviewRender(); scNotice('Очередь выполняется…');
   try {
+    const requests = [];
     for (const entry of scReviewPack.entries) for (let i = 0; i < entry.jobs.length; i++) {
-      if (scReviewStop || scReviewClosed) return;
+      if (scReviewStop || scReviewClosed) break;
       const job = entry.jobs[i];
       if (action === 'sc-submit' ? job.check?.id || job.rejected : !job.check?.id) continue;
-      await scReviewMessage({ action, bidId: entry.bidId, job: i });
-      await scReviewLoad();
+      requests.push(scReviewMessage({ action, bidId: entry.bidId, job: i }));
     }
+    const outcomes = await Promise.allSettled(requests);
+    if (scReviewClosed) return;
+    const failed = outcomes.filter(result => result.status === 'rejected');
+    if (failed.length) throw new Error(`${failed.length} из ${outcomes.length}: ${failed[0].reason.message}`);
     scNotice(action === 'sc-submit' ? 'Отправка завершена. Нажмите «Обновить результаты» для получения текущих статусов.' : 'Результаты обновлены.');
   } catch (e) { scNotice(`Очередь приостановлена: ${e.message}`); }
   finally { scReviewBusy = false; if (!scReviewClosed) await scReviewLoad().catch(e => scNotice(e.message)); }

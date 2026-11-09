@@ -2,6 +2,13 @@
 
 const scDefaultConfig = { url: 'https://216.57.104.188/', key: '', interval: 800, mapping: PM_SOCIAL.defaults };
 let scSerial = Promise.resolve();
+let scLimitSerial = Promise.resolve();
+const scInFlight = new Map();
+function scExclusive(fn) {
+  const task = scSerial.then(fn);
+  scSerial = task.catch(() => {});
+  return task;
+}
 const scLive = new Map();
 const scSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const scPage = (sender, page) => sender.url?.split('?')[0] === chrome.runtime.getURL(page);
@@ -20,18 +27,44 @@ async function scSave(pack) { await PM_DB.set('package:' + pack.id, pack); }
 function scAssertLive(id) {
   if (id && !scLive.get(id)?.size) throw new Error('Очередь приостановлена: страница результатов закрыта');
 }
-async function scApi(path, { method = 'GET', query, key, owner } = {}) {
+function scBackoff(retry = 0) {
+  const task = scLimitSerial.then(async () => {
+    const limit = await PM_DB.get('api-limit') || { next: 0, failures: 0 };
+    limit.failures++;
+    limit.next = Math.max(limit.next, Date.now() + Math.max(retry, Math.min(60000, 2500 * 2 ** Math.min(limit.failures, 5))));
+    await PM_DB.set('api-limit', limit);
+  });
+  scLimitSerial = task.catch(() => {});
+  return task;
+}
+function scRecovered() {
+  const task = scLimitSerial.then(async () => {
+    const limit = await PM_DB.get('api-limit');
+    // A successful in-flight request must not erase another response's cooldown.
+    if (limit && limit.next <= Date.now()) await PM_DB.set('api-limit', { ...limit, failures: 0 });
+  });
+  scLimitSerial = task.catch(() => {});
+  return task;
+}
+async function scApi(path, { method = 'GET', query, key, owner, binding, preflight } = {}) {
+  // No normal request spacing. Only a server/network cooldown delays new starts.
+  for (;;) {
+    await scLimitSerial;
+    const limit = await PM_DB.get('api-limit') || { next: 0 };
+    await scSleep(Math.max(0, limit.next - Date.now()));
+    await scLimitSerial;
+    if ((await PM_DB.get('api-limit'))?.next > Date.now()) continue;
+    break;
+  }
+  scAssertLive(owner);
   const config = await scConfig();
+  if (binding && binding !== await scBinding(config)) throw new Error('URL или ключ магазина изменились. Для этого пакета API заблокирован');
   if (!config.key) throw new Error('Укажите API-ключ в настройках');
   if (!await chrome.permissions.contains({ origins: [new URL(config.url).origin + '/*'] })) {
     throw new Error('Нет разрешения на доступ к серверу. Сохраните настройки Social Check');
   }
-  const limit = await PM_DB.get('api-limit') || { next: 0, failures: 0 };
-  await scSleep(Math.max(0, limit.next - Date.now()));
+  await preflight?.();
   scAssertLive(owner);
-  // Persist the reservation before starting the request, including across worker restarts.
-  limit.next = Date.now() + 2500;
-  await PM_DB.set('api-limit', limit);
   let response;
   try {
     response = await fetch(new URL('api/v1/' + path, config.url).href, {
@@ -40,18 +73,14 @@ async function scApi(path, { method = 'GET', query, key, owner } = {}) {
       ...(query ? { body: JSON.stringify(query) } : {}), signal: AbortSignal.timeout(30000),
     });
   } catch (_) {
-    limit.failures++;
-    limit.next = Date.now() + Math.min(60000, 2500 * 2 ** Math.min(limit.failures, 5));
-    await PM_DB.set('api-limit', limit);
+    await scBackoff();
     throw new Error('Сетевой сбой. Результат отправки неизвестен; повтор использует прежний ключ');
   }
   if (response.status === 429 || response.status >= 500) {
-    limit.failures++;
     const header = response.headers.get('Retry-After');
     const retry = header && /^\d+(\.\d+)?$/.test(header) ? Number(header) * 1000 : Math.max(0, Date.parse(header) - Date.now()) || 0;
-    limit.next = Date.now() + Math.max(2500, retry, Math.min(60000, 2500 * 2 ** Math.min(limit.failures, 5)));
-  } else limit.failures = 0;
-  await PM_DB.set('api-limit', limit);
+    await scBackoff(retry);
+  }
   if (!response.ok) {
     const messages = { 400: 'API отклонил параметры', 401: 'Неверный API-ключ', 402: 'Недостаточно средств',
       403: 'Доступ запрещён', 409: 'Конфликт ключа идемпотентности', 429: 'Лимит API: повторите позднее', 503: 'Биллинг временно недоступен' };
@@ -59,6 +88,7 @@ async function scApi(path, { method = 'GET', query, key, owner } = {}) {
     error.httpStatus = response.status;
     throw error;
   }
+  await scRecovered();
   let json;
   try { json = await response.json(); } catch (_) { throw new Error('API вернул некорректный JSON; повторите с прежним ключом'); }
   return json;
@@ -210,15 +240,28 @@ async function scHandle(msg, sender) {
   scAssertLive(owner);
   const job = entry.jobs[msg.job];
   if (!job) throw new Error('Проверка не найдена');
+  const slot = JSON.stringify([pack.id, entry.bidId, msg.job]);
+  if (scInFlight.has(slot)) { const running = scInFlight.get(slot); return () => running; }
   if (msg.action === 'sc-submit' && job.check?.id) return {};
   if (msg.action === 'sc-submit' && job.rejected) throw new Error('Запрос отклонён API. Автоматический новый платный запрос запрещён');
   if (msg.action === 'sc-refresh' && !job.check?.id) return {};
   // Keys and exact query already durably stored at package creation, before any POST.
   job.error = null; job.attempted = true; await scSave(pack);
+  const running = scRunCheck(msg, pack, entry, job, owner);
+  scInFlight.set(slot, running);
+  running.then(() => scInFlight.delete(slot), () => scInFlight.delete(slot));
+  return () => running;
+}
+async function scRunCheck(msg, pack, entry, job, owner) {
+  let error;
   try {
+    const request = { owner, binding: pack.binding, preflight: async () => {
+      const latest = await scPackage(pack.id);
+      if (latest.entries.find(e => e.bidId === entry.bidId)?.jobs[msg.job]?.key !== job.key) throw new Error('Проверка в пакете изменилась');
+    } };
     const check = msg.action === 'sc-submit'
-      ? await scApi('checks', { method: 'POST', query: job.query, key: job.key, owner })
-      : await scApi('checks/' + encodeURIComponent(job.check.id), { owner });
+      ? await scApi('checks', { ...request, method: 'POST', query: job.query, key: job.key })
+      : await scApi('checks/' + encodeURIComponent(job.check.id), request);
     if (typeof check.id !== 'string' || !Object.hasOwn(PM_SOCIAL.statuses, check.status) ||
         !check.query || check.query.platform !== job.query.platform || check.query.identifier_type !== job.query.identifier_type ||
         PM_SOCIAL.normalize(job.query.identifier_type, check.query.identifier || '') !== PM_SOCIAL.normalize(job.query.identifier_type, job.query.identifier) ||
@@ -228,9 +271,21 @@ async function scHandle(msg, sender) {
     job.error = e.message;
     // Auth/balance/limit are safe to resume manually. No fresh keys on any retry.
     if ([400, 409].includes(e.httpStatus)) job.rejected = true;
-    await scSave(pack); throw e;
+    error = e;
   }
-  await scSave(pack); return {};
+  await scExclusive(async () => {
+    // Other requests, DOM sync and manual decisions may have changed this package.
+    // Never overwrite it with the snapshot captured before the network request.
+    const latest = await scPackage(pack.id);
+    const target = latest.entries.find(e => e.bidId === entry.bidId)?.jobs[msg.job];
+    if (!target || target.key !== job.key) throw new Error('Проверка в пакете изменилась');
+    target.error = job.error;
+    if (job.check) target.check = job.check;
+    if (job.rejected) target.rejected = true;
+    await scSave(latest);
+  });
+  if (error) throw error;
+  return {};
 }
 chrome.runtime.onConnect.addListener(port => {
   if (!port.name.startsWith('pm-review:') || !scPage(port.sender, 'review.html')) return;
@@ -241,8 +296,7 @@ chrome.runtime.onConnect.addListener(port => {
 });
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (!msg?.action?.startsWith('sc-') || msg.action === 'sc-source') return;
-  const task = scSerial.then(() => scHandle(msg, sender));
-  scSerial = task.catch(() => {});
+  const task = scExclusive(() => scHandle(msg, sender)).then(result => typeof result === 'function' ? result() : result);
   task.then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
   return true;
 });

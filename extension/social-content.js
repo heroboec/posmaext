@@ -5,6 +5,8 @@ let pmSocialPreparing = false;
 const pmSocialPackages = new Map();
 let pmSocialLastResponse = 0;
 let pmSocialAdminQueue = Promise.resolve();
+let pmSocialProductQueue = Promise.resolve();
+let pmSocialLastProductStart = 0;
 const pmSocialSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function pmSocialMessage(message) {
   const result = await chrome.runtime.sendMessage(message);
@@ -46,12 +48,9 @@ function pmSocialMetadata(item, platform) {
   return { bidId: item.bidId, status: item.select.value, category: pmGetRowCategory(item.row)?.name || '',
     subcategory: (item.row.querySelector('[data-section-subcategory]')?.textContent || categorySpans[1]?.textContent || '').replace(/^[\s\\/]+/, '').trim(), platform, properties };
 }
-function pmSocialAdmin(body, preflight, minimumInterval = 0) {
-  const task = pmSocialAdminQueue.then(async () => {
-    await pmSocialSleep(Math.max(0, pmSocialLastResponse + Math.max(minimumInterval, pmSocialConfig?.interval || 800) - Date.now()));
-    preflight?.();
-    const csrf = pmGetCsrf();
-    if (!csrf) throw new Error('Не найден CSRF-токен. Обновите страницу админки');
+async function pmSocialAdminFetch(body) {
+  const csrf = pmGetCsrf();
+  if (!csrf) throw new Error('Не найден CSRF-токен. Обновите страницу админки');
     try {
       const response = await fetch(location.origin + '/req/bids.php', { method: 'POST', credentials: 'include', redirect: 'error',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-CSRF-TOKEN': csrf, 'X-Requested-With': 'XMLHttpRequest' },
@@ -59,6 +58,23 @@ function pmSocialAdmin(body, preflight, minimumInterval = 0) {
       if (!response.ok) throw new Error(`Админка: HTTP ${response.status}`);
       try { return await response.json(); } catch (_) { throw new Error('Админка вернула не JSON. Проверьте вход на сайт'); }
     } finally { pmSocialLastResponse = Date.now(); }
+}
+function pmSocialAdmin(body, preflight, minimumInterval = 0) {
+  if (body.do === 'list') {
+    const start = pmSocialProductQueue.then(async () => {
+      await pmSocialSleep(Math.max(0, pmSocialLastProductStart + Math.max(1000, minimumInterval, pmSocialConfig?.interval || 800) - Date.now()));
+      preflight?.();
+      pmSocialLastProductStart = Date.now();
+      // Wrap the request so the start queue does not await the HTTP response.
+      return { request: pmSocialAdminFetch(body) };
+    });
+    pmSocialProductQueue = start.then(() => {}, () => {});
+    return start.then(({ request }) => request);
+  }
+  const task = pmSocialAdminQueue.then(async () => {
+    await pmSocialSleep(Math.max(0, pmSocialLastResponse + Math.max(minimumInterval, pmSocialConfig?.interval || 800) - Date.now()));
+    preflight?.();
+    return pmSocialAdminFetch(body);
   });
   pmSocialAdminQueue = task.catch(() => {});
   return task;
@@ -169,10 +185,10 @@ function pmSocialWizard(items, startIndex = 0, packageId = crypto.randomUUID()) 
       catch (e) { loading = false; wizardError = e.message; render(); }
     }
   }
-  async function preload() {
+  function preload() {
     for (const item of items) {
       if (closed) return;
-      if (!item.rows && !item.error && item.status !== '4') await load(item);
+      if (!item.rows && !item.error && item.status !== '4') load(item);
     }
   }
   function render() {

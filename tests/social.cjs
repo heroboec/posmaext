@@ -86,13 +86,80 @@ test('worker protects key/settings and persists only compact selected values wit
   assert.equal((await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' })).ok, true);
   assert.equal(w.requests.length, 1);
 });
-test('one global API queue: GET catalog, POSTs and GET results share persisted 2500ms spacing', async () => {
+test('API starts concurrent checks without spacing and merges reverse results without losing sibling jobs or source status', async () => {
   const w = worker(); await w.setup(); const id = await w.create();
-  await w.send({ action: 'sc-test' }, optionsSender); // invalid catalog body still consumes one request
-  await Promise.all([0, 1].map(job => w.send({ action: 'sc-submit', id, bidId: '42', job, client: 'client' })));
-  await w.send({ action: 'sc-refresh', id, bidId: '42', job: 0, client: 'client' });
-  assert.equal(w.requests.length, 4);
-  for (let i = 1; i < w.requests.length; i++) assert.ok(w.requests[i].at - w.requests[i - 1].at >= 2500);
+  const pending = [];
+  w.context.fetch = (url, options) => new Promise(resolve => pending.push({ resolve, options, at: w.context.Date.now() }));
+  const first = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  const second = w.send({ action: 'sc-submit', id, bidId: '42', job: 1, client: 'client' });
+  for (let i = 0; i < 100 && pending.length < 2; i++) await settle();
+  assert.equal(pending.length, 2, 'Both HTTP requests must start while neither response has arrived');
+  assert.equal(pending[0].at, pending[1].at, 'No artificial API interval');
+  const duplicate = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  await settle(); assert.equal(pending.length, 2, 'Concurrent duplicate must share the existing request');
+  assert.equal((await w.send({ action: 'sc-sync', id })).ok, true);
+  const response = index => ({ ok: true, status: 202, headers: new Headers(), json: async () => ({
+    id: 'check-' + index, status: 'pending', query: JSON.parse(pending[index].options.body) }) });
+  pending[1].resolve(response(1)); assert.equal((await second).ok, true);
+  pending[0].resolve(response(0)); assert.equal((await first).ok, true); assert.equal((await duplicate).ok, true);
+  const pack = (await w.send({ action: 'sc-get', id })).package;
+  assert.deepEqual(pack.entries[0].jobs.map(j => j.check.id), ['check-0', 'check-1']);
+  assert.equal(pack.entries[0].sourceStatus, '2');
+});
+test('deleting a package during an API request does not resurrect it on completion', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(); let release;
+  w.context.fetch = (url, options) => new Promise(resolve => { release = () => resolve({ ok: true, status: 202, headers: new Headers(),
+    json: async () => ({ id: 'synthetic-check', status: 'pending', query: JSON.parse(options.body) }) }); });
+  const request = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  for (let i = 0; i < 100 && !release; i++) await settle();
+  assert.equal(typeof release, 'function', 'HTTP must already be in flight before deletion');
+  assert.equal((await w.send({ action: 'sc-delete', id })).ok, true);
+  release(); await request;
+  assert.equal((await w.send({ action: 'sc-get', id })).ok, false);
+  assert.equal((await w.send({ action: 'sc-list' })).packages.length, 0);
+});
+test('deleting a package during cooldown prevents its still-unsent paid POST', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(), timers = [];
+  await w.context.api.db.set('api-limit', { next: w.context.Date.now() + 12000, failures: 1 });
+  w.context.setTimeout = (fn, ms) => { if (ms > 0) timers.push({ fn, ms }); else queueMicrotask(fn); };
+  const request = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  for (let i = 0; i < 100 && !timers.length; i++) await settle();
+  assert.equal(timers.length, 1);
+  assert.equal((await w.send({ action: 'sc-delete', id })).ok, true);
+  w.advance(timers[0].ms); timers[0].fn();
+  assert.equal((await request).ok, false);
+  assert.equal(w.requests.length, 0, 'Deleted packages must not initiate paid requests');
+});
+test('successful recovery resets failures before the next independent error', async () => {
+  const w = worker(); await w.setup(); const id = await w.create();
+  let status = 500;
+  w.context.fetch = async (url, options) => ({ ok: status === 202, status, headers: new Headers(),
+    json: async () => ({ id: 'synthetic-check', status: 'pending', query: JSON.parse(options.body) }) });
+  await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  status = 202;
+  assert.equal((await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' })).ok, true);
+  assert.equal((await w.context.api.db.get('api-limit')).failures, 0);
+  status = 500;
+  await w.send({ action: 'sc-submit', id, bidId: '42', job: 1, client: 'client' });
+  const limit = await w.context.api.db.get('api-limit');
+  assert.equal(limit.failures, 1);
+  assert.equal(limit.next - w.context.Date.now(), 5000);
+});
+test('a concurrent successful response does not erase another requests Retry-After', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(), pending = [];
+  w.context.fetch = (url, options) => new Promise(resolve => pending.push({ resolve, options }));
+  const first = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  const second = w.send({ action: 'sc-submit', id, bidId: '42', job: 1, client: 'client' });
+  for (let i = 0; i < 100 && pending.length < 2; i++) await settle();
+  assert.equal(pending.length, 2);
+  pending[0].resolve({ ok: false, status: 429, headers: new Headers({ 'Retry-After': '12' }) });
+  assert.equal((await first).ok, false);
+  const limit = await w.context.api.db.get('api-limit');
+  pending[1].resolve({ ok: true, status: 202, headers: new Headers(), json: async () => ({
+    id: 'synthetic-check', status: 'pending', query: JSON.parse(pending[1].options.body) }) });
+  assert.equal((await second).ok, true);
+  assert.equal((await w.context.api.db.get('api-limit')).next, limit.next);
+  assert.ok(limit.next - w.context.Date.now() >= 12000);
 });
 test('uncertain POST survives worker restart, retries same key/query; changed store blocks old packages', async () => {
   const w = worker(); await w.setup(); const id = await w.create();
@@ -199,7 +266,7 @@ test('wizard: only single supported filter, first 10 visible fixed, list request
     assert.equal(s.messages.some(m => m.action === 'sc-create'), false);
   } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
 });
-test('wizard preloads products without navigation, waits one second after response, and cancellation stops queued requests', async () => {
+test('wizard starts products one second apart without waiting for responses, binds reverse responses and cancels queued starts', async () => {
   const s = content(3), timers = [];
   try {
     await settle();
@@ -209,20 +276,22 @@ test('wizard preloads products without navigation, waits one second after respon
     s.w.fetch = async (url, options) => {
       s.requests.push({ body: new URLSearchParams(options.body.toString()) });
       if (s.requests.length === 1) await new Promise(resolve => { resolveFirst = resolve; });
-      return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] }) };
+      return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_' + options.body.get('bid_id') + ':SYNTHETIC_PASSWORD' }] }) };
     };
     s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
     s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
     assert.equal(timers.length, 1); timers.shift().fn(); await settle();
     assert.equal(s.requests.length, 1);
-    assert.equal(timers.length, 0, 'No timer for the next request until response completes');
-    now = 15000; resolveFirst(); await settle();
-    assert.match(s.root().textContent, /1 из 3/);
-    assert.ok(timers[0], 'The second request must be queued without navigation');
+    assert.ok(timers[0], 'The second start must be scheduled while the first response is pending');
     assert.equal(timers[0].ms, 1000);
     now += 1000; timers.shift().fn(); await settle();
     assert.deepEqual(s.requests.map(r => r.body.get('bid_id')), ['42', '43']);
     assert.match(s.root().textContent, /1 из 3/, 'Preload must not navigate the form');
+    resolveFirst(); await settle();
+    assert.match(s.root().textContent, /test_42/);
+    assert.doesNotMatch(s.root().textContent, /test_43/);
+    s.button('Пропустить').click(); await settle();
+    assert.match(s.root().textContent, /test_43/);
     assert.equal(timers[0].ms, 1000);
     s.button('Отмена').click(); now += 1000; timers.shift().fn(); await settle();
     assert.equal(s.requests.length, 2, 'Cancellation must prevent the third request');

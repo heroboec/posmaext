@@ -25,15 +25,29 @@ async function review(jobs, failSubmit = false) {
 }
 const job = status => ({ query: { platform: 'instagram', identifier_type: 'username', identifier: 'test_profile' }, key: 'synthetic-key',
   check: { id: 'synthetic-check', status, query: {}, result: { data: { followers: 0, bio: null } } } });
+test('account table omits avatar, link, name, username and bio, keeping identity in the heading', async () => {
+  const profile = job('found');
+  Object.assign(profile.check.result.data, { avatar_url: 'https://example.test/avatar', profile_url: 'https://example.test/profile',
+    display_name: 'Synthetic name', username: 'synthetic_name', external_id: '123', registration_date: '2020-05-17' });
+  const s = await review([profile]);
+  try {
+    const card = s.w.document.querySelector('.check');
+    const rows = [...card.querySelectorAll('tbody tr')];
+    assert.deepEqual(rows.map(tr => tr.firstChild.textContent),
+      ['ID', 'Регистрация', 'Публикации', 'Друзья', 'Подписчики', 'Подписки']);
+    assert.match(card.querySelector('h3').textContent, /test_profile/);
+    assert.equal(rows.find(tr => tr.firstChild.textContent === 'Регистрация').lastChild.textContent, '2020-05-17');
+  } finally { s.dom.window.close(); }
+});
 test('review renders readable properties, 0 vs null, one product column and unavailable without claiming absence', async () => {
   const s = await review([job('unavailable')]);
   try {
     const table = s.w.document.querySelector('article table');
-    assert.equal(table.querySelectorAll('thead th').length, 3);
+    assert.equal(table.querySelectorAll('thead th').length, 2);
     const followers = [...table.querySelectorAll('tbody tr')].find(tr => tr.firstChild.textContent === 'Подписчики');
-    assert.deepEqual([...followers.children].map(td => td.textContent), ['Подписчики', '100', '0']);
-    const bio = [...table.querySelectorAll('tbody tr')].find(tr => tr.firstChild.textContent === 'Описание');
-    assert.equal(bio.lastChild.textContent, 'Нет данных');
+    assert.deepEqual([...followers.children].map(td => td.textContent), ['Подписчики', '0']);
+    const registration = [...table.querySelectorAll('tbody tr')].find(tr => tr.firstChild.textContent === 'Регистрация');
+    assert.equal(registration.lastChild.textContent, 'Нет данных');
     assert.match(s.w.document.querySelector('.check').textContent, /Недоступно \(не означает отсутствие\)/);
     assert.match(s.w.document.querySelector('article').textContent, /Непроверяемое свойство/);
     assert.equal(s.w.document.querySelector('pre'), null);
@@ -41,17 +55,23 @@ test('review renders readable properties, 0 vs null, one product column and unav
     assert.equal(s.messages.filter(m => m.action === 'sc-submit').length, 0);
   } finally { s.dom.window.close(); }
 });
-test('review queue pauses on first API error rather than advancing or issuing a fresh paid check', async () => {
+test('review dispatches the batch concurrently, reports errors and does not issue fresh paid retries', async () => {
   const pendingJob = { query: job('pending').query, key: 'synthetic-key' };
-  const s = await review([pendingJob, { ...pendingJob, key: 'synthetic-key-2' }], true);
+  const s = await review([pendingJob, { ...pendingJob, key: 'synthetic-key-2' }]);
   try {
+    const send = s.w.chrome.runtime.sendMessage, pending = [];
+    s.w.chrome.runtime.sendMessage = msg => msg.action === 'sc-submit'
+      ? new Promise(resolve => pending.push(resolve)) : send(msg);
     s.w.document.getElementById('check').click(); await settle();
-    assert.equal(s.messages.filter(m => m.action === 'sc-submit').length, 1);
+    assert.equal(pending.length, 2, 'Send the second job before the first responds');
+    pending[0]({ ok: false, error: 'Synthetic pause' }); await settle();
+    assert.equal(s.w.document.getElementById('check').disabled, true, 'Wait for already-sent jobs even after one fails');
+    pending[1]({ ok: true }); await settle();
     assert.match(s.w.document.getElementById('notice').textContent, /Очередь приостановлена/);
     assert.equal(s.w.document.getElementById('check').disabled, false);
   } finally { s.dom.window.close(); }
 });
-test('each account compares only its own data against the same supplier claim', async () => {
+test('each account shows only its own data; supplier claims remain in a separate block', async () => {
   const first = job('found'), second = job('found');
   first.query.identifier = 'synthetic_first'; first.check.result.data.followers = 120;
   second.query.identifier = 'synthetic_second'; second.check.result.data.followers = 5;
@@ -61,13 +81,16 @@ test('each account compares only its own data against the same supplier claim', 
     assert.equal(cards.length, 2);
     for (const [i, actual] of ['120', '5'].entries()) {
       const table = cards[i].querySelector('table');
-      assert.ok(table, 'Each account needs its own supplier comparison');
+      assert.ok(table, 'Each account needs its own data table');
       assert.deepEqual([...table.querySelectorAll('thead th')].map(th => th.textContent),
-        ['Свойство', 'Заявлено поставщиком', 'Данные аккаунта']);
+        ['Свойство', 'Данные аккаунта']);
       const followers = [...table.querySelectorAll('tbody tr')].find(tr => tr.firstChild.textContent === 'Подписчики');
-      assert.deepEqual([...followers.children].map(td => td.textContent), ['Подписчики', '100', actual]);
-      assert.equal(table.querySelectorAll('thead th').length, 3);
+      assert.deepEqual([...followers.children].map(td => td.textContent), ['Подписчики', actual]);
+      assert.equal(table.querySelectorAll('thead th').length, 2);
     }
+    const supplierRows = [...s.w.document.querySelectorAll('article > table tr')];
+    assert.deepEqual(supplierRows.map(tr => [...tr.children].map(cell => cell.textContent)),
+      [['Подписчики', '100'], ['Непроверяемое свойство', 'Synthetic']]);
     assert.equal(s.w.document.querySelectorAll('article > .scroll').length, 0);
   } finally { s.dom.window.close(); }
 });
