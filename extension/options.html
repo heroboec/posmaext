@@ -20,7 +20,7 @@
     .err { color: #c0392b; }
     .section { border: 1px solid #e8e8e8; border-radius: 6px; padding: 14px 16px; margin-bottom: 20px; }
     .section-title { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
-    input[type=text] { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+    input[type=text], input[type=password], input[type=number] { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
     button.secondary { padding: 7px 16px; background: #f5f5f5; color: #333; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; font-size: 13px; }
     button.secondary:hover { background: #e8e8e8; }
     #update-result { font-size: 13px; margin-top: 10px; min-height: 18px; }
@@ -29,6 +29,27 @@
 </head>
 <body>
   <h2>Position Matcher — Настройки</h2>
+
+  <div class="section">
+    <div class="section-title">Social Check</div>
+    <label for="social-url">Адрес API</label>
+    <input type="text" id="social-url" value="https://216.57.104.188/">
+    <label for="social-key">API-ключ магазина</label>
+    <input type="password" id="social-key" autocomplete="off">
+    <div id="social-key-state" class="hint"></div>
+    <label><input type="checkbox" id="social-clear-key"> Удалить сохранённый ключ</label>
+    <label for="social-interval">Пауза после ответа админки, мс (не менее 800)</label>
+    <input type="number" id="social-interval" min="800" max="60000" value="800">
+    <label for="social-mapping">Категория = платформа (одна пара на строку)</label>
+    <textarea id="social-mapping" spellcheck="false"></textarea>
+    <div class="hint">Название категории должно точно совпадать с фильтром. Платформы: instagram, x, tiktok, youtube, reddit. После сохранения проверьте связь, чтобы загрузить доступные способы поиска. Ключ не передаётся сайту. Новый найденный профиль оплачивается даже при наличии кеша сервера.</div>
+    <div class="row">
+      <button class="secondary" id="social-save" disabled>Сохранить Social Check</button>
+      <button class="secondary" id="social-test">Проверить связь</button>
+      <a href="review.html" target="_blank" rel="noopener">Сохранённые пакеты</a>
+    </div>
+    <p id="social-status" role="status"></p>
+  </div>
 
   <div class="section">
     <div class="section-title">URL-паттерны</div>
@@ -72,5 +93,6 @@
 
   <script src="rejection-reasons.js"></script>
   <script src="options.js"></script>
+  <script src="social-options.js"></script>
 </body>
 </html>

@@ -1,4 +1,5 @@
 'use strict';
+importScripts('social-common.js', 'social-store.js', 'social-worker.js');
 
 // Keys left by the old full version (CSV base etc.). csvData alone can exceed the
 // 10 MB storage quota, which makes every later write fail — drop them on install/update.

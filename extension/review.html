@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Position Matcher — Проверка заявок</title>
+  <link rel="stylesheet" href="review.css">
+</head>
+<body>
+  <header><h1>Проверка заявок</h1><a href="options.html" target="_blank" rel="noopener">Настройки</a></header>
+  <p>Решения принимаются только вручную. Недоступный профиль не означает, что он отсутствует. Новая найденная проверка оплачивается, в том числе из кеша.</p>
+  <nav id="packages" aria-label="Сохранённые пакеты"></nav>
+  <section id="controls" hidden>
+    <p id="summary"></p>
+    <div class="actions">
+      <button id="check">Проверить / продолжить</button>
+      <button id="refresh">Обновить результаты</button>
+      <button id="stop" disabled>Приостановить очередь</button>
+      <button id="sync">Сверить статусы с админкой</button>
+      <button id="reconnect">Восстановить связь</button>
+      <button id="delete">Удалить пакет</button>
+    </div>
+    <p class="hint">Закрытие этой вкладки останавливает новые клиентские запросы. Уже принятые сервером проверки завершатся. Повтор неопределённой отправки использует тот же ключ и не создаёт новую платную проверку.</p>
+  </section>
+  <p id="notice" role="status"></p>
+  <main id="entries"></main>
+  <script src="rejection-reasons.js"></script>
+  <script src="social-common.js"></script>
+  <script src="content.js"></script>
+  <script src="review.js"></script>
+</body>
+</html>

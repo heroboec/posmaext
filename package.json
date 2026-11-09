@@ -1,0 +1,6 @@
+{
+  "name": "position-matcher-tests",
+  "private": true,
+  "scripts": { "test": "node --test tests/*.cjs" },
+  "devDependencies": { "fake-indexeddb": "^6.2.4", "jsdom": "^24.1.3" }
+}

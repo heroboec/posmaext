@@ -166,6 +166,7 @@ function pmRenderFilterPanel() {
   saleBtn.disabled = !!pmBusy;
   saleBtn.onclick = pmSetBatchSale;
   panel.appendChild(saleBtn);
+  if (typeof pmSocialButton === 'function') pmSocialButton(panel);
 
   const sep = document.createElement('span');
   sep.className = 'pm-filter-sep';
@@ -567,7 +568,7 @@ function pmShowDeclineDialog(bidId, onDone, options = {}) {
   const submit = root.querySelector('.pm-modal-submit');
   const cancel = root.querySelector('.pm-modal-cancel');
   const previouslyFocused = document.activeElement;
-  const close = () => { backdrop.remove(); previouslyFocused?.focus(); };
+  const close = () => { backdrop.remove(); previouslyFocused?.focus(); options.onClose?.(); };
 
   const doSubmit = async () => {
     if (submit.disabled) return;

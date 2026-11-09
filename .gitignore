@@ -9,3 +9,6 @@
 # User rejection lists are private local data
 /exports/
 /rejection-reasons*.txt
+
+# Local test dependencies (the extension has no build step)
+node_modules/
