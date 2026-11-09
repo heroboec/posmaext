@@ -43,25 +43,27 @@ function scReviewRender() {
     const checks = scNode('div', undefined, article); checks.className = 'checks';
     entry.jobs.forEach((job, i) => {
       const card = scNode('section', undefined, checks); card.className = 'check';
-      scNode('h3', `Товар ${i + 1}: ${job.query.identifier}`, card);
+      scNode('h3', `Аккаунт ${i + 1}: ${job.query.identifier}`, card);
       scNode('p', job.check ? PM_SOCIAL.statuses[job.check.status] : job.attempted ? 'Отправка не подтверждена' : 'Ещё не отправлен', card);
       if (job.check?.id) scNode('p', `Проверка: ${job.check.id}`, card);
       if (job.check?.reason) scNode('p', scReasons[job.check.reason] || 'Источник не предоставил результат', card);
       if (job.check?.previously_requested !== null && job.check?.previously_requested !== undefined) scNode('p', `Запрашивался ранее: ${job.check.previously_requested ? 'Да' : 'Нет'}`, card);
       if (job.check?.result?.source_observed_at) scNode('p', `Данные источника: ${job.check.result.source_observed_at}`, card);
       if (job.error) scNode('p', job.error, card).className = 'error';
+      scNode('h4', 'Сравнение с описанием поставщика', card);
+      const scroll = scNode('div', undefined, card); scroll.className = 'scroll';
+      const table = scNode('table', undefined, scroll), head = scNode('tr', undefined, scNode('thead', undefined, table));
+      ['Свойство', 'Заявлено поставщиком', 'Данные аккаунта'].forEach(t => scNode('th', t, head));
+      const body = scNode('tbody', undefined, table);
+      // Both accounts use supplier claims independently, never each other's results.
+      // Only exact, unique labels are matched. Everything else remains below verbatim.
+      for (const [field, label] of Object.entries(PM_SOCIAL.fields)) {
+        const matching = entry.properties.filter(p => p.label.replace(/:$/, '').trim().toLocaleLowerCase('ru') === label.toLocaleLowerCase('ru'));
+        const property = matching.length === 1 ? matching[0] : null;
+        const tr = scNode('tr', undefined, body);
+        [label, property ? property.value : 'Не сопоставлено', scValue(job.check?.result?.data?.[field])].forEach(v => scNode('td', v, tr));
+      }
     });
-    const scroll = scNode('div', undefined, article); scroll.className = 'scroll';
-    const table = scNode('table', undefined, scroll), head = scNode('tr', undefined, scNode('thead', undefined, table));
-    ['Свойство', 'Заявлено', ...entry.jobs.map((_, i) => `Товар ${i + 1}`)].forEach(t => scNode('th', t, head));
-    const body = scNode('tbody', undefined, table);
-    // Only exact, unique labels are matched. Everything else remains below verbatim.
-    for (const [field, label] of Object.entries(PM_SOCIAL.fields)) {
-      const matching = entry.properties.filter(p => p.label.replace(/:$/, '').trim().toLocaleLowerCase('ru') === label.toLocaleLowerCase('ru'));
-      const property = matching.length === 1 ? matching[0] : null;
-      const tr = scNode('tr', undefined, body);
-      [label, property ? property.value : 'Не сопоставлено', ...entry.jobs.map(job => scValue(job.check?.result?.data?.[field]))].forEach(v => scNode('td', v, tr));
-    }
     scNode('h3', 'Исходные свойства поставщика', article);
     if (!entry.properties.length) scNode('p', 'В доступной разметке свойства не найдены', article);
     else {

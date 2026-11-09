@@ -51,3 +51,23 @@ test('review queue pauses on first API error rather than advancing or issuing a 
     assert.equal(s.w.document.getElementById('check').disabled, false);
   } finally { s.dom.window.close(); }
 });
+test('each account compares only its own data against the same supplier claim', async () => {
+  const first = job('found'), second = job('found');
+  first.query.identifier = 'synthetic_first'; first.check.result.data.followers = 120;
+  second.query.identifier = 'synthetic_second'; second.check.result.data.followers = 5;
+  const s = await review([first, second]);
+  try {
+    const cards = [...s.w.document.querySelectorAll('.check')];
+    assert.equal(cards.length, 2);
+    for (const [i, actual] of ['120', '5'].entries()) {
+      const table = cards[i].querySelector('table');
+      assert.ok(table, 'Each account needs its own supplier comparison');
+      assert.deepEqual([...table.querySelectorAll('thead th')].map(th => th.textContent),
+        ['Свойство', 'Заявлено поставщиком', 'Данные аккаунта']);
+      const followers = [...table.querySelectorAll('tbody tr')].find(tr => tr.firstChild.textContent === 'Подписчики');
+      assert.deepEqual([...followers.children].map(td => td.textContent), ['Подписчики', '100', actual]);
+      assert.equal(table.querySelectorAll('thead th').length, 3);
+    }
+    assert.equal(s.w.document.querySelectorAll('article > .scroll').length, 0);
+  } finally { s.dom.window.close(); }
+});

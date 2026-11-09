@@ -194,9 +194,69 @@ test('wizard: only single supported filter, first 10 visible fixed, list request
     s.button('Пропустить').click(); await settle();
     assert.equal(s.requests[1].body.get('bid_id'), '43');
     s.button('Назад').click(); await settle();
-    assert.equal(s.requests.length, 2); // Memory cache, not a second-page request.
+    assert.equal(s.requests.length, 10); // Background preload, not a second-page request.
     s.button('Отмена').click(); assert.equal(s.root(), undefined);
     assert.equal(s.messages.some(m => m.action === 'sc-create'), false);
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+test('wizard preloads products without navigation, waits one second after response, and cancellation stops queued requests', async () => {
+  const s = content(3), timers = [];
+  try {
+    await settle();
+    let now = 10000, resolveFirst;
+    s.w.Date.now = () => now;
+    s.w.setTimeout = (fn, ms) => { if (ms === 150) queueMicrotask(fn); else timers.push({ fn, ms }); return 1; };
+    s.w.fetch = async (url, options) => {
+      s.requests.push({ body: new URLSearchParams(options.body.toString()) });
+      if (s.requests.length === 1) await new Promise(resolve => { resolveFirst = resolve; });
+      return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] }) };
+    };
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    assert.equal(timers.length, 1); timers.shift().fn(); await settle();
+    assert.equal(s.requests.length, 1);
+    assert.equal(timers.length, 0, 'No timer for the next request until response completes');
+    now = 15000; resolveFirst(); await settle();
+    assert.match(s.root().textContent, /1 из 3/);
+    assert.ok(timers[0], 'The second request must be queued without navigation');
+    assert.equal(timers[0].ms, 1000);
+    now += 1000; timers.shift().fn(); await settle();
+    assert.deepEqual(s.requests.map(r => r.body.get('bid_id')), ['42', '43']);
+    assert.match(s.root().textContent, /1 из 3/, 'Preload must not navigate the form');
+    assert.equal(timers[0].ms, 1000);
+    s.button('Отмена').click(); now += 1000; timers.shift().fn(); await settle();
+    assert.equal(s.requests.length, 2, 'Cancellation must prevent the third request');
+    assert.equal(s.root(), undefined);
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+test('background completion preserves the current column choice and continues after another bid fails', async () => {
+  const s = content(3);
+  try {
+    await settle(); let releaseSecond;
+    s.w.fetch = async (url, options) => {
+      const body = new URLSearchParams(options.body.toString()); s.requests.push({ body });
+      if (body.get('bid_id') === '43') {
+        await new Promise(resolve => { releaseSecond = resolve; });
+        return { ok: true, json: async () => ({ code: 5 }) };
+      }
+      return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] }) };
+    };
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    const column = s.root().querySelector('[data-column]');
+    column.value = '1'; column.dispatchEvent(new s.w.Event('change'));
+    releaseSecond(); await settle();
+    assert.deepEqual(s.requests.map(r => r.body.get('bid_id')), ['42', '43', '44']);
+    assert.equal(s.root().querySelector('[data-column]'), column, 'Background response must not redraw the active form');
+    assert.equal(column.value, '1');
+    assert.match(s.root().textContent, /1 из 3/);
+    s.button('Пропустить').click(); await settle();
+    assert.match(s.root().textContent, /2 из 3/);
+    assert.ok(s.button('Повторить загрузку'));
+    s.button('Пропустить').click(); await settle();
+    assert.match(s.root().textContent, /3 из 3/);
+    assert.ok(s.root().querySelector('[data-column]'));
+    s.button('Отмена').click();
   } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
 });
 test('wizard: reject before column choice, cancel restores step, server error retains synthetic reason', async () => {

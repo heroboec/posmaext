@@ -4,6 +4,7 @@ let pmSocialConfig = null;
 let pmSocialPreparing = false;
 const pmSocialPackages = new Map();
 let pmSocialLastResponse = 0;
+let pmSocialAdminQueue = Promise.resolve();
 const pmSocialSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function pmSocialMessage(message) {
   const result = await chrome.runtime.sendMessage(message);
@@ -45,18 +46,22 @@ function pmSocialMetadata(item, platform) {
   return { bidId: item.bidId, status: item.select.value, category: pmGetRowCategory(item.row)?.name || '',
     subcategory: (item.row.querySelector('[data-section-subcategory]')?.textContent || categorySpans[1]?.textContent || '').replace(/^[\s\\/]+/, '').trim(), platform, properties };
 }
-async function pmSocialAdmin(body, preflight) {
-  await pmSocialSleep(Math.max(0, pmSocialLastResponse + (pmSocialConfig?.interval || 800) - Date.now()));
-  preflight?.();
-  const csrf = pmGetCsrf();
-  if (!csrf) throw new Error('Не найден CSRF-токен. Обновите страницу админки');
-  try {
-    const response = await fetch(location.origin + '/req/bids.php', { method: 'POST', credentials: 'include', redirect: 'error',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-CSRF-TOKEN': csrf, 'X-Requested-With': 'XMLHttpRequest' },
-      body: new URLSearchParams(body), signal: AbortSignal.timeout(30000) });
-    if (!response.ok) throw new Error(`Админка: HTTP ${response.status}`);
-    try { return await response.json(); } catch (_) { throw new Error('Админка вернула не JSON. Проверьте вход на сайт'); }
-  } finally { pmSocialLastResponse = Date.now(); }
+function pmSocialAdmin(body, preflight, minimumInterval = 0) {
+  const task = pmSocialAdminQueue.then(async () => {
+    await pmSocialSleep(Math.max(0, pmSocialLastResponse + Math.max(minimumInterval, pmSocialConfig?.interval || 800) - Date.now()));
+    preflight?.();
+    const csrf = pmGetCsrf();
+    if (!csrf) throw new Error('Не найден CSRF-токен. Обновите страницу админки');
+    try {
+      const response = await fetch(location.origin + '/req/bids.php', { method: 'POST', credentials: 'include', redirect: 'error',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-CSRF-TOKEN': csrf, 'X-Requested-With': 'XMLHttpRequest' },
+        body: new URLSearchParams(body), signal: AbortSignal.timeout(30000) });
+      if (!response.ok) throw new Error(`Админка: HTTP ${response.status}`);
+      try { return await response.json(); } catch (_) { throw new Error('Админка вернула не JSON. Проверьте вход на сайт'); }
+    } finally { pmSocialLastResponse = Date.now(); }
+  });
+  pmSocialAdminQueue = task.catch(() => {});
+  return task;
 }
 async function pmSocialChange(item, status, message = '') {
   const current = pmSocialCurrent(item.bidId);
@@ -120,17 +125,20 @@ function pmSocialWizard(items, startIndex = 0, packageId = crypto.randomUUID()) 
     draftColumn: item.draftColumn, draftType: item.draftType,
   })) });
   async function load(item) {
-    loading = true; render();
+    item.queued = false; item.loading = true;
+    if (item === items[index]) render();
     try {
-      const current = pmSocialCurrent(item.bidId);
-      if (!current || current.select.value !== item.status) throw new Error('Строка или статус изменились');
-      const response = await pmSocialAdmin({ do: 'list', bid_id: item.bidId, order_id: '0', mode: '0' });
+      const response = await pmSocialAdmin({ do: 'list', bid_id: item.bidId, order_id: '0', mode: '0' }, () => {
+        if (closed) throw new Error('Подготовка отменена');
+        const current = pmSocialCurrent(item.bidId);
+        if (!current || current.select.value !== item.status || item.status === '4') throw new Error('Строка или статус изменились');
+      }, 1000);
       if (!closed) { item.rows = PM_SOCIAL.rows(response); item.error = ''; }
     } catch (e) { if (!closed) item.error = e.message; }
-    finally { loading = false; if (!closed) render(); }
+    finally { item.loading = false; if (!closed && item === items[index]) render(); }
   }
   async function advance(skip = false) {
-    if (advancing || loading || closed) return;
+    if (advancing || loading || items[index].loading || items[index].queued || closed) return;
     advancing = true; wizardError = '';
     try { await advanceInner(skip); }
     catch (e) { wizardError = e.message; }
@@ -152,7 +160,7 @@ function pmSocialWizard(items, startIndex = 0, packageId = crypto.randomUUID()) 
     render();
     try { await saveDraft(); }
     catch (e) { wizardError = e.message; return; }
-    if (index + 1 < items.length) { index++; await saveDraft(); render(); await ensureLoaded(); }
+    if (index + 1 < items.length) { index++; await saveDraft(); render(); }
     else {
       const entries = items.filter(i => i.selection && !i.skipped && i.status !== '4').map(i => ({ ...i, rows: undefined, selection: undefined, error: undefined, ...i.selection }));
       if (!entries.length) { await pmSocialMessage({ action: 'sc-draft-delete' }); close(); return; }
@@ -161,14 +169,20 @@ function pmSocialWizard(items, startIndex = 0, packageId = crypto.randomUUID()) 
       catch (e) { loading = false; wizardError = e.message; render(); }
     }
   }
-  async function ensureLoaded() { const item = items[index]; if (!item.rows && !item.error && item.status !== '4') await load(item); }
+  async function preload() {
+    for (const item of items) {
+      if (closed) return;
+      if (!item.rows && !item.error && item.status !== '4') await load(item);
+    }
+  }
   function render() {
     const item = items[index]; dialog.replaceChildren();
+    const currentLoading = loading || item.loading || item.queued;
     element('h2', `Заявка #${item.bidId} — ${index + 1} из ${items.length}`);
     element('p', `${item.category} · ${item.subcategory || 'Подкатегория не указана'} · статус ${item.status}`);
     element('p', 'Одна страница товаров. Выберите столбец: расширение случайно возьмёт до двух различных корректных значений.');
-    element('p', wizardError || item.error || (loading ? 'Загрузка…' : '' )).className = 'error';
-    if (item.rows && !loading && item.status !== '4') {
+    element('p', wizardError || item.error || (currentLoading ? 'Загрузка…' : '' )).className = 'error';
+    if (item.rows && !currentLoading && item.status !== '4') {
       const width = Math.max(0, ...item.rows.map(r => r.length));
       const controls = element('div'); controls.className = 'controls';
       const label = element('label', 'Столбец ', controls), column = element('select', undefined, label); column.dataset.column = '';
@@ -189,10 +203,10 @@ function pmSocialWizard(items, startIndex = 0, packageId = crypto.randomUUID()) 
       if (item.selection) element('p', `Выбрано: ${item.selection.identifiers.join(', ')} (сохраняется при возврате к этому шагу)`);
     }
     const actions = element('div'); actions.className = 'controls';
-    button('Назад', () => { index--; saveDraft().catch(() => {}); render(); ensureLoaded(); }, actions, loading || advancing || index === 0);
-    button(index === items.length - 1 ? 'Открыть результаты' : 'Далее', () => advance(), actions, loading || advancing || !item.rows || item.status === '4');
-    button('Пропустить', () => advance(true), actions, loading || advancing);
-    if (item.error) button('Повторить загрузку', () => load(item), actions, loading || advancing);
+    button('Назад', () => { index--; saveDraft().catch(() => {}); render(); }, actions, loading || advancing || index === 0);
+    button(index === items.length - 1 ? 'Открыть результаты' : 'Далее', () => advance(), actions, currentLoading || advancing || !item.rows || item.status === '4');
+    button('Пропустить', () => advance(true), actions, currentLoading || advancing);
+    if (item.error) button('Повторить загрузку', () => load(item), actions, currentLoading || advancing);
     button('Отклонить заявку', () => {
       host.remove();
       let done = false;
@@ -203,7 +217,7 @@ function pmSocialWizard(items, startIndex = 0, packageId = crypto.randomUUID()) 
         // Success callback follows close synchronously; cancellation only restores the wizard.
         queueMicrotask(() => { if (!done && !closed) { document.body.append(host); render(); } });
       } });
-    }, actions, loading || advancing || item.status === '4');
+    }, actions, currentLoading || advancing || item.status === '4');
     button('Отмена', close, actions, loading || advancing);
     actions.querySelector('button:not(:disabled)')?.focus();
   }
@@ -215,7 +229,8 @@ function pmSocialWizard(items, startIndex = 0, packageId = crypto.randomUUID()) 
       else if (!e.shiftKey && root.activeElement === last) { e.preventDefault(); first?.focus(); }
     }
   });
-  render(); saveDraft().catch(() => {}); ensureLoaded();
+  items.forEach(item => { item.queued = !item.rows && !item.error && item.status !== '4'; });
+  render(); saveDraft().catch(() => {}); preload();
 }
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg?.action !== 'sc-source' || sender.id !== chrome.runtime.id) return;
