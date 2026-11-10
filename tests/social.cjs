@@ -298,6 +298,125 @@ test('wizard starts products one second apart without waiting for responses, bin
     assert.equal(s.root(), undefined);
   } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
 });
+test('product timeout retries only the failed bid and succeeds within three attempts', async () => {
+  const s = content(2);
+  try {
+    await settle(); let attempts = 0;
+    s.w.fetch = async (url, options) => {
+      const body = new URLSearchParams(options.body.toString()); s.requests.push({ body });
+      if (body.get('bid_id') === '42' && ++attempts < 3) throw new s.w.DOMException('Synthetic timeout', 'TimeoutError');
+      return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_' + body.get('bid_id') + ':SYNTHETIC_PASSWORD' }] }) };
+    };
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    assert.deepEqual(s.requests.map(r => r.body.get('bid_id')), ['42', '43', '42', '42']);
+    assert.match(s.root().textContent, /test_42/);
+    assert.ok(s.root().querySelector('[data-column]'));
+    s.button('Пропустить').click(); await settle();
+    assert.match(s.root().textContent, /test_43/);
+    assert.equal(s.messages.some(m => m.action === 'sc-create'), false);
+    s.button('Отмена').click();
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+test('product timeouts stop after three attempts and allow a fresh manual attempt', async () => {
+  const s = content();
+  try {
+    await settle(); let attempts = 0;
+    s.w.fetch = async () => { attempts++; throw new s.w.DOMException('Synthetic timeout', 'TimeoutError'); };
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    assert.equal(attempts, 3);
+    assert.equal(s.button('Повторить загрузку').disabled, false);
+    s.w.fetch = async () => { attempts++; return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] }) }; };
+    s.button('Повторить загрузку').click(); await settle();
+    assert.equal(attempts, 4);
+    assert.ok(s.root().querySelector('[data-column]'));
+    s.button('Отмена').click();
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+test('product timeout while reading the response body is retried', async () => {
+  const s = content();
+  try {
+    await settle(); let attempts = 0;
+    s.w.fetch = async () => ({ ok: true, json: async () => {
+      if (++attempts === 1) throw new s.w.DOMException('Synthetic timeout', 'TimeoutError');
+      return { code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] };
+    } });
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    assert.equal(attempts, 2);
+    assert.ok(s.root().querySelector('[data-column]'));
+    s.button('Отмена').click();
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+test('body AbortError caused by the timeout signal is retried with a fresh signal', async () => {
+  const s = content(), controllers = [];
+  try {
+    await settle(); let attempts = 0;
+    s.w.AbortSignal = { timeout: () => { const controller = new AbortController(); controllers.push(controller); return controller.signal; } };
+    s.w.fetch = async (url, options) => ({ ok: true, json: async () => {
+      if (++attempts === 1) {
+        controllers[0].abort(new DOMException('Synthetic timeout', 'TimeoutError'));
+        throw new DOMException('Body aborted', 'AbortError');
+      }
+      assert.equal(options.signal.aborted, false, 'An expired timeout signal cannot be reused');
+      return { code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] };
+    } });
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    assert.equal(attempts, 2);
+    assert.ok(s.root().querySelector('[data-column]'));
+    s.button('Отмена').click();
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+for (const stop of ['cancel', 'status']) test(`product retry uses the start interval and rechecks ${stop} before sending`, async () => {
+  const s = content(), timers = [];
+  try {
+    await settle(); let now = 10000, attempts = 0;
+    s.w.Date.now = () => now;
+    s.w.setTimeout = (fn, ms) => { if (ms === 150) queueMicrotask(fn); else timers.push({ fn, ms }); return 1; };
+    s.w.fetch = async () => { attempts++; throw new s.w.DOMException('Synthetic timeout', 'TimeoutError'); };
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    timers.shift().fn(); await settle();
+    assert.equal(attempts, 1);
+    assert.equal(timers[0]?.ms, 1000, 'Retry must use the same start queue, not bypass its interval');
+    if (stop === 'cancel') s.button('Отмена').click();
+    else s.w.document.getElementById('status_id42').value = '4';
+    now += 1000; timers.shift().fn(); await settle();
+    assert.equal(attempts, 1);
+    if (stop === 'cancel') assert.equal(s.root(), undefined);
+    else { assert.match(s.root().textContent, /Строка или статус изменились/); s.button('Отмена').click(); }
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+for (const failure of ['network', 'abort', 'http', 'json', 'list']) test(`product ${failure} errors are not automatically retried`, async () => {
+  const s = content();
+  try {
+    await settle(); let attempts = 0;
+    s.w.fetch = async () => {
+      attempts++;
+      if (failure === 'network') throw new TypeError('Synthetic network error');
+      if (failure === 'abort') throw new s.w.DOMException('Synthetic abort', 'AbortError');
+      if (failure === 'http') return { ok: false, status: 504 };
+      return { ok: true, json: async () => { if (failure === 'json') throw new SyntaxError('Synthetic malformed JSON'); return { code: 5 }; } };
+    };
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    assert.equal(attempts, 1);
+    assert.equal(s.button('Повторить загрузку').disabled, false);
+    s.button('Отмена').click();
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+test('manual status timeout is never automatically retried', async () => {
+  const s = content();
+  try {
+    await settle(); let attempts = 0;
+    s.w.fetch = async () => { attempts++; throw new s.w.DOMException('Synthetic timeout', 'TimeoutError'); };
+    await assert.rejects(s.w.eval("pmSocialChange({bidId:'42',status:'2'}, '3')"), { name: 'TimeoutError' });
+    assert.equal(attempts, 1);
+    assert.equal(s.w.document.getElementById('status_id42').value, '2');
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
 test('background completion preserves the current column choice and continues after another bid fails', async () => {
   const s = content(3);
   try {

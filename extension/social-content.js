@@ -52,11 +52,16 @@ async function pmSocialAdminFetch(body) {
   const csrf = pmGetCsrf();
   if (!csrf) throw new Error('Не найден CSRF-токен. Обновите страницу админки');
     try {
+      const signal = AbortSignal.timeout(30000);
       const response = await fetch(location.origin + '/req/bids.php', { method: 'POST', credentials: 'include', redirect: 'error',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-CSRF-TOKEN': csrf, 'X-Requested-With': 'XMLHttpRequest' },
-        body: new URLSearchParams(body), signal: AbortSignal.timeout(30000) });
+        body: new URLSearchParams(body), signal });
       if (!response.ok) throw new Error(`Админка: HTTP ${response.status}`);
-      try { return await response.json(); } catch (_) { throw new Error('Админка вернула не JSON. Проверьте вход на сайт'); }
+      try { return await response.json(); } catch (e) {
+        if (signal.aborted && signal.reason?.name === 'TimeoutError') throw signal.reason;
+        if (e.name === 'TimeoutError') throw e;
+        throw new Error('Админка вернула не JSON. Проверьте вход на сайт');
+      }
     } finally { pmSocialLastResponse = Date.now(); }
 }
 function pmSocialAdmin(body, preflight, minimumInterval = 0) {
@@ -141,15 +146,23 @@ function pmSocialWizard(items, startIndex = 0, packageId = crypto.randomUUID()) 
     draftColumn: item.draftColumn, draftType: item.draftType,
   })) });
   async function load(item) {
-    item.queued = false; item.loading = true;
+    item.queued = false; item.loading = true; item.error = '';
     if (item === items[index]) render();
     try {
-      const response = await pmSocialAdmin({ do: 'list', bid_id: item.bidId, order_id: '0', mode: '0' }, () => {
-        if (closed) throw new Error('Подготовка отменена');
-        const current = pmSocialCurrent(item.bidId);
-        if (!current || current.select.value !== item.status || item.status === '4') throw new Error('Строка или статус изменились');
-      }, 1000);
-      if (!closed) { item.rows = PM_SOCIAL.rows(response); item.error = ''; }
+      for (let attempt = 1; attempt <= 3 && !closed; attempt++) {
+        try {
+          const response = await pmSocialAdmin({ do: 'list', bid_id: item.bidId, order_id: '0', mode: '0' }, () => {
+            if (closed) throw new Error('Подготовка отменена');
+            const current = pmSocialCurrent(item.bidId);
+            if (!current || current.select.value !== item.status || item.status === '4') throw new Error('Строка или статус изменились');
+          }, 1000);
+          if (!closed) { item.rows = PM_SOCIAL.rows(response); item.error = ''; }
+          break;
+        } catch (e) {
+          if (closed) break;
+          if (e.name !== 'TimeoutError' || attempt === 3) throw e;
+        }
+      }
     } catch (e) { if (!closed) item.error = e.message; }
     finally { item.loading = false; if (!closed && item === items[index]) render(); }
   }
