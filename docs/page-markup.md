@@ -14,6 +14,10 @@
 - Категория: `div[data-section-category]`, внутри span с названием и img с иконкой.
 - ID/раскрытие: `a[data-bid-id-show-section]`.
 - Редактирование свойств: `a.bid-macro-values-edit-outside-link`.
+- Название позиции: `.bids-item-title`. Кнопка «Cookies — править значения» ищет
+  `cookies` без учёта регистра только в тексте названия, не во всей строке.
+  Открывает ссылки редактирования заявки у всех подходящих видимых строк,
+  без лимита 10, сверху вниз с паузой 800 мс. Свойства каталога не открывает.
 - Статус: `#status_id{id}`, fallback `select[name="status"]`.
 - В исходном select есть `data-current-status` и inline onchange
   `admin_bids.change_status(id, value)`. Для выбора 4 расширение теперь открывает

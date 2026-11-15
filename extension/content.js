@@ -66,7 +66,7 @@ const PM_BATCH_LIMIT   = 10;
 const PM_BATCH_DELAY   = 800;
 const PM_REVIEW_STATUS = new Set(['2', '6', '7']); // на проверке / 48ч / 72ч
 const PM_SALE_STATUS   = '3';                       // аккаунты в продаже
-let   pmBusy = null; // null = idle, otherwise { kind: 'open' | 'sale', progress: 'i/total' }
+let   pmBusy = null; // null = idle, otherwise { kind, progress: 'i/total' }
 
 function pmGetBatch() {
   const batch = [];
@@ -87,6 +87,22 @@ function pmSaleCandidates(batch) {
   return batch.filter(b => b.select && PM_REVIEW_STATUS.has(b.select.value));
 }
 
+// Separate from pmGetBatch: this explicit action has no ten-row limit.
+function pmGetCookiesBatch() {
+  const items = [];
+  for (const tr of document.querySelectorAll('tr.bids-tr-table-new:not(.pm-hidden-by-filter)')) {
+    const title = tr.querySelector('.bids-item-title')?.textContent || '';
+    const link = tr.querySelector('a.bid-macro-values-edit-outside-link')?.href;
+    if (/cookies/i.test(title) && link) items.push({ link });
+  }
+  return items;
+}
+
+function pmCookiesBtnText() {
+  if (pmBusy?.kind === 'cookies') return `… ${pmBusy.progress}`;
+  return `↗ Cookies — править значения (${pmGetCookiesBatch().length})`;
+}
+
 function pmOpenBtnText() {
   if (pmBusy?.kind === 'open') return `… ${pmBusy.progress}`;
   return `↗ Править значения (${pmGetBatch().filter(b => b.link).length})`;
@@ -100,12 +116,14 @@ function pmSaleBtnText() {
 function pmSetBusy(kind, i, total) {
   pmBusy = { kind, progress: `${i}/${total}` };
   pmSyncSelection();
-  const btn = document.querySelector(kind === 'open' ? '.pm-filter-open-btn' : '.pm-filter-sale-btn');
-  if (btn) btn.textContent = kind === 'open' ? pmOpenBtnText() : pmSaleBtnText();
+  const btn = document.querySelector(kind === 'cookies' ? '.pm-filter-cookies-btn' :
+    kind === 'open' ? '.pm-filter-open-btn' : '.pm-filter-sale-btn');
+  if (btn) btn.textContent = kind === 'cookies' ? pmCookiesBtnText() :
+    kind === 'open' ? pmOpenBtnText() : pmSaleBtnText();
 }
 
 async function pmRunBatch(kind, items, step) {
-  document.querySelectorAll('.pm-filter-open-btn, .pm-filter-sale-btn').forEach(b => { b.disabled = true; });
+  document.querySelectorAll('.pm-filter-open-btn, .pm-filter-sale-btn, .pm-filter-cookies-btn').forEach(b => { b.disabled = true; });
   for (let i = 0; i < items.length; i++) {
     pmSetBusy(kind, i + 1, items.length);
     step(items[i]);
@@ -121,6 +139,13 @@ function pmOpenMacroLinks() {
   const items = pmGetBatch().filter(b => b.link);
   if (!items.length) return;
   pmRunBatch('open', items, b => chrome.runtime.sendMessage({ action: 'open-tab', url: b.link }));
+}
+
+function pmOpenCookiesLinks() {
+  if (pmBusy || document.querySelector('.pm-modal-backdrop')) return;
+  const items = pmGetCookiesBatch();
+  if (!items.length) return;
+  pmRunBatch('cookies', items, b => chrome.runtime.sendMessage({ action: 'open-tab', url: b.link }));
 }
 
 function pmSetBatchSale() {
@@ -158,6 +183,14 @@ function pmRenderFilterPanel() {
   openBtn.disabled = !!pmBusy;
   openBtn.onclick = pmOpenMacroLinks;
   panel.appendChild(openBtn);
+
+  const cookiesBtn = document.createElement('button');
+  cookiesBtn.className = 'pm-filter-btn pm-filter-cookies-btn';
+  cookiesBtn.textContent = pmCookiesBtnText();
+  cookiesBtn.title = 'Открыть «Править значения заявки» для всех видимых поставок с cookies в названии, без лимита, с паузой 800 мс';
+  cookiesBtn.disabled = !!pmBusy;
+  cookiesBtn.onclick = pmOpenCookiesLinks;
+  panel.appendChild(cookiesBtn);
 
   const saleBtn = document.createElement('button');
   saleBtn.className = 'pm-filter-btn pm-filter-sale-btn';
@@ -211,6 +244,9 @@ function pmUpdateFilterPanel() {
   });
   if (changed) pmRenderFilterPanel();
   if (pmActiveFilters.size) pmApplyFilter(); // newly loaded rows
+  const cookiesBtn = document.querySelector('.pm-filter-cookies-btn');
+  const cookiesText = pmCookiesBtnText();
+  if (cookiesBtn && cookiesBtn.textContent !== cookiesText) cookiesBtn.textContent = cookiesText;
 }
 
 // ── Macro-values page (/bids/macro-values/{id}) ──────────────────────────────
@@ -455,7 +491,7 @@ function pmDeclineSelected() {
     send: async (message, progress) => {
       if (pmBusy) throw new Error('Дождитесь завершения текущей операции');
       pmBusy = { kind: 'decline', progress: '' };
-      document.querySelectorAll('.pm-filter-open-btn, .pm-filter-sale-btn').forEach(b => { b.disabled = true; });
+      document.querySelectorAll('.pm-filter-open-btn, .pm-filter-sale-btn, .pm-filter-cookies-btn').forEach(b => { b.disabled = true; });
       pmSyncSelection();
       const failed = [], errors = [];
       try {
