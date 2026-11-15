@@ -17,6 +17,35 @@ function setup(html, url = 'https://example.test/bids') {
 }
 const settle = () => new Promise(resolve => setTimeout(resolve, 380));
 
+test('item properties: link sits below the entire product block, not inside its title', async () => {
+  const dom = setup(`<tr class="bids-tr-table-new"><td class="bids-info-product">
+    <section class="bids-section-item">
+      <div class="bids-info-product-item">
+        <div id="item_control_101"></div>
+        <div class="product-info"><div class="bids-item-title">
+          <a onclick="admin_bids.item_id_dialog(101, 901)">Synthetic long item title</a>
+        </div></div>
+        <div class="get-category"></div>
+      </div>
+      <div class="bid-macro-values-edit-outside"><a href="/bids/macro-values/101">Supplier properties</a></div>
+    </section>
+  </td></tr>`);
+  try {
+    const doc = dom.window.document;
+    const product = doc.querySelector('.bids-info-product-item');
+    const link = doc.querySelector('.pm-item-properties-link');
+    assert.ok(link);
+    assert.equal(product.contains(link), false);
+    assert.equal(product.nextElementSibling, link);
+    assert.equal(link.nextElementSibling.className, 'bid-macro-values-edit-outside');
+    product.querySelector('a').setAttribute('onclick', 'admin_bids.item_id_dialog(101, 905)');
+    await settle();
+    assert.equal(product.nextElementSibling, link);
+    assert.equal(link.href, 'https://example.test/catalog/item-properties/905');
+    assert.equal(doc.querySelectorAll('.pm-item-properties-link').length, 1);
+  } finally { dom.window.close(); }
+});
+
 test('item properties: uses second argument and current origin for every row class', () => {
   const dom = setup(row(101, 'admin_bids.item_id_dialog(101, 901)') +
     row(102, 'return admin_bids.item_id_dialog( 102 , 902 );', 'tr_saled'));

@@ -660,7 +660,9 @@ function pmSyncItemPropertiesLinks() {
     }
     const href = `${location.origin}/catalog/item-properties/${itemId}`;
     if (link.href !== href) link.href = href;
-    if (source.nextElementSibling !== link) source.after(link);
+    // Keep the title's full width: the product block contains the site's horizontal layout.
+    const anchor = source.closest('.bids-info-product-item') || source;
+    if (anchor.nextElementSibling !== link) anchor.after(link);
   });
 }
 
