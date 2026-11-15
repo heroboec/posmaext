@@ -1,5 +1,11 @@
 tr.pm-hidden-by-filter { display: none !important; }
 
+.pm-item-properties-link {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+}
+
 .pm-filter-panel {
   position: fixed;
   top: 60px;

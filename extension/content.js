@@ -640,11 +640,36 @@ function pmIsMacroValuesPage() {
     !!document.getElementById('bid-macro-values-edit-form');
 }
 
+// Catalog item ID is the second argument, not the bid ID in the first argument.
+function pmSyncItemPropertiesLinks() {
+  document.querySelectorAll('tr.bids-tr-table-new').forEach(row => {
+    let source = null;
+    let itemId = null;
+    for (const el of row.querySelectorAll('[onclick]')) {
+      const match = el.getAttribute('onclick').match(/\badmin_bids\.item_id_dialog\(\s*\d+\s*,\s*([1-9]\d*)\s*\)/);
+      if (match) { source = el; itemId = match[1]; break; }
+    }
+    let link = row.querySelector('.pm-item-properties-link');
+    if (!source) { link?.remove(); return; }
+    if (!link) {
+      link = document.createElement('a');
+      link.className = 'pm-item-properties-link';
+      link.textContent = 'Свойства позиции';
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+    }
+    const href = `${location.origin}/catalog/item-properties/${itemId}`;
+    if (link.href !== href) link.href = href;
+    if (source.nextElementSibling !== link) source.after(link);
+  });
+}
+
 function pmStart() {
   // The macro-values page has its own behaviour (field sorting + floating save), no filter panel.
   if (pmObserver || !pmListEnabled()) return;
   if (pmUrlMatches()) pmUpdateFilterPanel();
   pmSyncSelection();
+  pmSyncItemPropertiesLinks();
 
   let timer = null;
   pmObserver = new MutationObserver((mutations) => {
@@ -654,9 +679,10 @@ function pmStart() {
       timer = null;
       if (pmUrlMatches()) pmUpdateFilterPanel();
       pmSyncSelection();
+      pmSyncItemPropertiesLinks();
     }, 150);
   });
-  pmObserver.observe(document.body, { childList: true, subtree: true });
+  pmObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['onclick'] });
 }
 
 chrome.storage.local.get(['urlPatterns', 'declineReasons'], (r) => {
