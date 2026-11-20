@@ -85,6 +85,12 @@ function scReviewRender() {
     const diagnostics = scNode('button', 'Диагностика запросов', actions); diagnostics.className = 'pm-diagnostics-open';
     diagnostics.onclick = () => scReviewDiagnostics(entry);
     const conflict = entry.sourceStatus !== undefined && entry.sourceStatus !== entry.status;
+    if (scReviewPack.auto && entry.extractionState !== 'pending' &&
+        (entry.extractionError || entry.extractionIssues?.length || !entry.jobs.length)) {
+      const manual = scNode('button', 'Выбрать столбец с логином', actions); manual.className = 'pm-manual-open';
+      manual.disabled = scReviewBusy || conflict || !scReviewSameStore || entry.status === '4';
+      manual.onclick = () => scReviewManual(entry);
+    }
     const accept = scNode('button', 'Принять → В продаже', actions); accept.className = 'accept';
     accept.disabled = scReviewBusy || conflict || !['2', '6', '7'].includes(entry.status);
     accept.onclick = () => { if (confirm(`Принять заявку #${entry.bidId} и перевести в продажу?`)) scReviewDecision(entry, 'accept'); };

@@ -43,6 +43,13 @@ const PM_SOCIAL = (() => {
     return !!json && !json.error && json.status !== 'error' &&
       (json.code === 0 || json.status === 'ok' || json.status === 'success' || json.success === true);
   }
-  return { defaults, fields, statuses, normalize, valid, rows, sample, types, serverSuccess,
+  function manualColumn(rows, indexes, delimiter, column, platform, type) {
+    if (![':', ';', '|', '\t'].includes(delimiter) || !Number.isInteger(column) || column < 0 || column > 1000) throw new Error('Выберите разделитель и столбец');
+    return indexes.map(index => {
+      const value = rows[index].split(delimiter)[column]?.trim() || '';
+      return { index, identifier: valid(platform, type, value) ? normalize(type, value) : null };
+    });
+  }
+  return { defaults, fields, statuses, normalize, valid, rows, sample, types, serverSuccess, manualColumn,
     retryLimit: 10, retryDelay: 2000 };
 })();

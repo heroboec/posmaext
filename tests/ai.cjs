@@ -391,3 +391,118 @@ test('all preview: cancellation stops pending chunks within the same bid', async
   assert.equal((await request).ok, false);
   assert.equal(pending.length, 2, 'The third chunk must not be sent after cancellation');
 });
+
+const reviewPage = { url: 'chrome-extension://test/review.html' };
+async function manualFixture() {
+  const w = setup(); await w.configure(); const run = await w.create();
+  const rows = ['test_user:SYNTHETIC_PASSWORD', 'mail@example.test:manual_profile:SYNTHETIC_PASSWORD',
+    'mail@example.test:manual_profile:SYNTHETIC_PASSWORD_2', 'mail@example.test::SYNTHETIC_PASSWORD'];
+  // A partial, completed extraction: only row 0 was confidently resolved.
+  w.ctx.fetch = async (url, init) => {
+    const input = JSON.parse(JSON.parse(init.body).messages[1].content).rows;
+    return { ok: true, status: 200, headers: new Headers(), json: async () => ({
+      choices: [{ message: { content: JSON.stringify({ accounts: input.map((row, index) => ({
+        index, type: 'username', identifier: row.value.startsWith('test_user:') ? 'test_user' : null,
+      })) }) } }],
+    }) };
+  };
+  assert.equal((await w.extract(run, '42', rows)).ok, true);
+  w.ctx.chrome.tabs.sendMessage = async (tab, msg) => {
+    assert.equal(tab, 7);
+    if (msg.command === 'account-preview') {
+      assert.equal(msg.bidId, '42'); assert.equal(msg.status, '2');
+      return { ok: true, rows, pageRows: rows.length };
+    }
+    return { ok: true, entries: [{ bidId: '42', status: '2' }] };
+  };
+  const preview = () => w.send({ action: 'ai-manual-preview', id: run.id, bidId: '42' }, reviewPage);
+  const apply = (snapshot, extra = {}) => w.send({ action: 'ai-manual-apply', id: run.id, bidId: '42',
+    digest: snapshot.digest, runId: snapshot.runId, delimiter: ':', column: 1, type: 'username', ...extra }, reviewPage);
+  return { w, run, rows, preview, apply };
+}
+test('manual column: only unresolved rows, unique jobs, original checks/keys preserved and no paid requests', async () => {
+  const { w, run, preview, apply } = await manualFixture();
+  const pack = await w.ctx.db.get('package:' + run.id);
+  pack.entries[0].jobs[0].check = { id: 'synthetic-check', status: 'found' };
+  await w.ctx.db.set('package:' + run.id, pack);
+  w.ctx.fetch = () => { throw new Error('Manual selection must not call a paid API'); };
+  const snapshot = await preview();
+  assert.equal(snapshot.ok, true, snapshot.error);
+  assert.deepEqual(Array.from(snapshot.rows, r => r.index), [1, 2, 3]);
+  const saved = await apply(snapshot); assert.equal(saved.ok, true, saved.error);
+  assert.equal(saved.added, 1); assert.equal(saved.remaining, 1);
+  const after = await w.ctx.db.get('package:' + run.id), entry = after.entries[0];
+  assert.deepEqual(entry.jobs[0], pack.entries[0].jobs[0]);
+  assert.equal(entry.jobs[1].query.identifier, 'manual_profile');
+  assert.equal(entry.extractionIssues.length, 1);
+  assert.equal(entry.extractedIndexes.length, 3);
+  assert.doesNotMatch(JSON.stringify(after), /SYNTHETIC_PASSWORD|mail@example\.test/);
+  const again = await apply(snapshot);
+  assert.equal(again.ok, false, 'Only an invalid unresolved row remains; no jobs should be added');
+  assert.equal((await w.ctx.db.get('package:' + run.id)).entries[0].jobs[1].key, entry.jobs[1].key);
+});
+test('manual column: trusted review only; bad type/column/delimiter and stale data rejected', async () => {
+  const { w, run, rows, preview, apply } = await manualFixture();
+  for (const sender of [source, options]) {
+    assert.equal((await w.send({ action: 'ai-manual-preview', id: run.id, bidId: '42' }, sender)).ok, false);
+    assert.equal((await w.send({ action: 'ai-manual-apply', id: run.id, bidId: '42' }, sender)).ok, false);
+  }
+  assert.equal((await w.send({ action: 'ai-manual-preview', id: run.id, bidId: '999' }, reviewPage)).ok, false);
+  const snapshot = await preview();
+  for (const extra of [{ type: 'id' }, { column: -1 }, { column: 1.5 }, { delimiter: '' },
+    { column: 0 }, { digest: 'changed' }, { runId: 'old-run' }]) {
+    assert.equal((await apply(snapshot, extra)).ok, false, JSON.stringify(extra));
+  }
+  rows[1] = 'mail@example.test:changed_profile:SYNTHETIC_PASSWORD';
+  assert.equal((await apply(snapshot)).ok, false);
+  assert.equal((await preview()).ok, false);
+  assert.equal((await w.ctx.db.get('package:' + run.id)).entries[0].jobs.length, 1);
+});
+test('manual column: paused queue remains paused; unavailable source or changed store blocks changes', async () => {
+  const { w, run, preview, apply } = await manualFixture();
+  await w.send({ action: 'ai-cancel', id: run.id }, reviewPage);
+  const snapshot = await preview();
+  assert.equal((await apply(snapshot)).ok, true);
+  assert.equal((await w.ctx.db.get('package:' + run.id)).aiPaused, true);
+  w.ctx.chrome.tabs.sendMessage = async () => ({ ok: false, error: 'Synthetic source status changed' });
+  assert.equal((await preview()).ok, false);
+  await w.send({ action: 'sc-config-save', config: { url: 'https://changed.example.test/', key: 'SYNTHETIC_OTHER_KEY', mapping: { Instagram: 'instagram' } } }, options);
+  assert.equal((await apply(snapshot)).ok, false);
+});
+test('manual column: a new extraction run or concurrent resolution cannot overwrite current jobs', async () => {
+  const { w, run, preview, apply } = await manualFixture();
+  const snapshot = await preview();
+  const pack = await w.ctx.db.get('package:' + run.id);
+  pack.runId = 'synthetic-new-run';
+  await w.ctx.db.set('package:' + run.id, pack);
+  assert.equal((await apply(snapshot)).ok, false);
+  pack.runId = snapshot.runId; pack.entries[0].extractionState = 'pending';
+  await w.ctx.db.set('package:' + run.id, pack);
+  assert.equal((await preview()).ok, false);
+  assert.equal((await w.ctx.db.get('package:' + run.id)).entries[0].jobs.length, 1);
+});
+test('automatic packages accept more than ten bids and retry retains their order', async () => {
+  const w = setup(); await w.configure(); const run = await w.create(24);
+  const pack = await w.ctx.db.get('package:' + run.id);
+  assert.equal(pack.entries.length, 24);
+  assert.deepEqual(pack.entries.map(e => e.bidId), Array.from({ length: 24 }, (_, i) => String(42 + i)));
+  const retry = await w.send({ action: 'sc-auto-create', packageId: run.id, entries: pack.entries });
+  assert.equal(retry.ok, true, retry.error);
+  assert.equal((await w.ctx.db.get('package:' + run.id)).entries.length, 24);
+});
+test('manual column: a fully failed bid can be recovered after worker diagnostic memory was lost', async () => {
+  const w = setup(); await w.configure(); const run = await w.create();
+  w.ctx.fetch = async () => ({ ok: false, status: 401, headers: new Headers() });
+  assert.equal((await w.extract(run, '42', ['mail@example.test;recovered_user;SYNTHETIC_PASSWORD'])).ok, false);
+  vm.runInContext('PM_DIAG.clear()', w.ctx);
+  w.ctx.chrome.tabs.sendMessage = async () => ({ ok: true, rows: ['mail@example.test;recovered_user;SYNTHETIC_PASSWORD'] });
+  const snapshot = await w.send({ action: 'ai-manual-preview', id: run.id, bidId: '42' }, reviewPage);
+  assert.equal(snapshot.ok, true, snapshot.error);
+  const result = await w.send({ action: 'ai-manual-apply', id: run.id, bidId: '42', digest: snapshot.digest,
+    runId: snapshot.runId, delimiter: ';', column: 1, type: 'username' }, reviewPage);
+  assert.equal(result.ok, true, result.error); assert.equal(result.added, 1); assert.equal(result.remaining, 0);
+  const pack = await w.ctx.db.get('package:' + run.id);
+  assert.equal(pack.entries[0].extractionComplete, true);
+  assert.equal(pack.entries[0].extractionError, '');
+  assert.equal(pack.entries[0].jobs[0].query.identifier, 'recovered_user');
+});

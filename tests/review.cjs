@@ -17,10 +17,13 @@ async function review(jobs, failSubmit = false, extra = {}) {
     if (msg.action === 'sc-list') return { ok: true, packages: [] };
     if (msg.action === 'sc-get') return { ok: true, package: structuredClone(pack), sameStore: true };
     if (msg.action === 'sc-diagnostics') return { ok: true, diagnostics: extra.diagnostics || { available: false, rowChoices: [], rows: [], ai: [], social: [] } };
+    if (msg.action === 'ai-manual-preview') return { ok: true, rows: [{ index: 1, value: 'mail@example.test|manual_profile|SYNTHETIC_PASSWORD' },
+      { index: 2, value: 'mail@example.test||SYNTHETIC_PASSWORD' }], digest: 'synthetic-digest', runId: 'synthetic-run', types: ['username'], platform: 'instagram' };
+    if (msg.action === 'ai-manual-apply') return { ok: true, added: 1, remaining: 1 };
     if (msg.action === 'sc-submit' && failSubmit) return { ok: false, error: 'Synthetic pause' };
     return { ok: true };
   } }, storage: { local: { get: (_, cb) => cb({}) }, onChanged: { addListener() {} } } };
-  for (const name of ['rejection-reasons.js', 'social-common.js', 'content.js', 'review-diagnostics.js', 'review.js']) {
+  for (const name of ['rejection-reasons.js', 'social-common.js', 'content.js', 'review-diagnostics.js', 'review-manual.js', 'review.js']) {
     const script = w.document.createElement('script'); script.textContent = file(name); w.document.head.append(script);
   }
   await settle(); return { w, dom, messages, pack, intervals };
@@ -100,6 +103,50 @@ test('each account occupies its own row; supplier properties table is removed', 
     assert.equal(supplierRows.length, 0);
     assert.equal(s.w.document.querySelectorAll('article > .scroll').length, 1);
   } finally { s.dom.window.close(); }
+});
+test('manual chooser: offered for unresolved automatic bids, previews columns, cancels without changes', async () => {
+  const s = await review([job('found')], false, { auto: true, entry: { extractionState: 'ready', extractionIssues: ['Строка 2: логин не определён'] } });
+  try {
+    s.w.document.querySelector('.pm-manual-open').click(); await settle();
+    const root = s.w.document.querySelector('.pm-modal-backdrop').shadowRoot;
+    assert.match(root.textContent, /manual_profile/);
+    assert.equal(root.querySelector('.pm-manual-apply').disabled, true);
+    const delimiter = root.querySelector('.pm-manual-delimiter');
+    delimiter.value = '|'; delimiter.dispatchEvent(new s.w.Event('change'));
+    const column = root.querySelector('.pm-manual-column');
+    column.value = '1'; column.dispatchEvent(new s.w.Event('change'));
+    assert.equal(root.querySelector('.pm-manual-apply').disabled, false);
+    assert.match(root.textContent, /Корректных значений: 1; останутся нераспознанными: 1/);
+    await s.intervals[0](); await settle();
+    assert.equal(s.w.document.querySelector('.pm-modal-backdrop').shadowRoot, root);
+    root.dispatchEvent(new s.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    assert.equal(s.w.document.querySelector('.pm-modal-backdrop'), null);
+    assert.equal(s.messages.some(m => m.action === 'ai-manual-apply'), false);
+  } finally { s.dom.window.close(); }
+});
+test('manual chooser: applying sends only the selection, never raw rows or new paid requests', async () => {
+  const s = await review([], false, { auto: true, entry: { extractionState: 'error', extractionError: 'Synthetic unresolved login' } });
+  try {
+    s.w.document.querySelector('.pm-manual-open').click(); await settle();
+    const root = s.w.document.querySelector('.pm-modal-backdrop').shadowRoot;
+    const delimiter = root.querySelector('.pm-manual-delimiter'); delimiter.value = '|'; delimiter.dispatchEvent(new s.w.Event('change'));
+    const column = root.querySelector('.pm-manual-column'); column.value = '1'; column.dispatchEvent(new s.w.Event('change'));
+    root.querySelector('.pm-manual-apply').click(); await settle();
+    const msg = s.messages.find(m => m.action === 'ai-manual-apply');
+    assert.equal(msg.bidId, '42'); assert.equal(msg.column, 1); assert.equal(msg.delimiter, '|');
+    assert.equal(msg.digest, 'synthetic-digest');
+    assert.doesNotMatch(JSON.stringify(msg), /SYNTHETIC_PASSWORD|manual_profile|mail@example/);
+    assert.equal(s.w.document.querySelector('.pm-modal-backdrop'), null);
+    assert.equal(s.messages.some(m => ['ai-extract', 'sc-submit', 'sc-refresh'].includes(m.action)), false);
+  } finally { s.dom.window.close(); }
+});
+test('manual chooser: hidden for successful/pending or non-automatic bids', async () => {
+  for (const extra of [{ auto: true, entry: { extractionState: 'ready' } },
+    { auto: true, entry: { extractionState: 'pending', extractionError: 'Synthetic error' } }, {}]) {
+    const s = await review([job('found')], false, extra);
+    try { assert.equal(s.w.document.querySelector('.pm-manual-open'), null); }
+    finally { s.dom.window.close(); }
+  }
 });
 test('diagnostics window is optional, renders source and responses as text and makes no paid requests', async () => {
   const s = await review([job('failed')], false, { diagnostics: {

@@ -334,6 +334,24 @@ function content(count = 1) {
   return { dom, w, requests, messages, root, button };
 }
 const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
+test('manual source preview reads only the requested bid, verifies membership/status and never fetches', async () => {
+  const s = content(2);
+  try {
+    await settle();
+    for (const id of [42, 43]) s.w.document.getElementById('status_id' + id).closest('tr').querySelector('td')
+      .insertAdjacentHTML('beforeend', `<div class="section-accounts-js-${id}"><span data-account-full="synthetic_${id}:SYNTHETIC_PASSWORD">short</span></div>`);
+    const send = extra => new Promise(resolve => s.w.sourceListener({ action: 'sc-source', command: 'account-preview',
+      origin: new URL(contentSender.url).origin, entries: [{ bidId: '42', status: '2' }], bidId: '42', status: '2', ...extra },
+    { id: 'synthetic' }, resolve));
+    const result = await send({});
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(Array.from(result.rows), ['synthetic_42:SYNTHETIC_PASSWORD']);
+    assert.equal((await send({ bidId: '43' })).ok, false);
+    s.w.document.getElementById('status_id42').value = '3';
+    assert.equal((await send({})).ok, false);
+    assert.equal(s.requests.length, 0);
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
 test('launch button: Instagram remains visible and explains a missing catalog or mapping', async () => {
   const s = content();
   try {
@@ -370,15 +388,18 @@ test('launch button: background connection errors are visible and focus retry re
     assert.equal(s.w.document.querySelector('.pm-filter-social-btn').disabled, false);
   } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
 });
-test('automation: first ten visible bids use their full DOM accounts without list fetch or column chooser', async () => {
-  const s = content(12), pending = [];
+test('automation: all visible filtered bids use full DOM accounts with bounded concurrency and no ten-bid limit', async () => {
+  const s = content(16), pending = [];
   try {
     await settle(); assert.equal(s.w.document.querySelector('.pm-filter-social-btn').disabled, true);
-    for (let id = 42; id < 54; id++) {
+    for (let id = 42; id < 58; id++) {
       const tr = s.w.document.getElementById('status_id' + id).closest('tr');
       tr.querySelector('td').insertAdjacentHTML('beforeend', `<div class="bids-item-title">Synthetic title ${id}</div>
         <div class="section-accounts-js-${id}"><span data-account-full="test_${id}:SYNTHETIC_SECRET">short…</span></div>`);
     }
+    s.w.document.getElementById('status_id52').closest('tr').hidden = true;
+    s.w.document.getElementById('status_id53').closest('tr').style.display = 'none';
+    s.w.document.getElementById('status_id54').closest('tr').querySelector('[data-section-category] span').textContent = 'Twitter';
     const send = s.w.chrome.runtime.sendMessage;
     s.w.chrome.runtime.sendMessage = msg => {
       if (msg.action === 'ai-extract') { s.messages.push(msg); return new Promise(resolve => pending.push({ msg, resolve })); }
@@ -391,9 +412,13 @@ test('automation: first ten visible bids use their full DOM accounts without lis
     assert.deepEqual(pending.map(p => p.msg.bidId), ['42','43','44','45','46','47','48','49','50','51']);
     assert.ok(pending.every(p => p.msg.rows[0] === `test_${p.msg.bidId}:SYNTHETIC_SECRET`));
     const create = s.messages.find(m => m.action === 'sc-auto-create');
+    assert.deepEqual(Array.from(create.entries, e => e.bidId), ['42','43','44','45','46','47','48','49','50','51','55','56','57']);
     assert.doesNotMatch(JSON.stringify(create), /SYNTHETIC_SECRET/);
     assert.equal(s.root().querySelector('[data-column]'), null);
-    for (const p of pending.reverse()) p.resolve({ ok: true, count: 1 });
+    for (const p of pending.slice().reverse()) p.resolve({ ok: true, count: 1 });
+    await settle();
+    assert.deepEqual(pending.slice(10).map(p => p.msg.bidId), ['55','56','57']);
+    for (const p of pending.slice(10)) p.resolve({ ok: true, count: 1 });
     await settle(); assert.equal(s.root(), undefined);
     assert.equal(s.w.eval('pmBusy'), null);
   } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }

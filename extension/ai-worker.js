@@ -161,7 +161,7 @@ async function aiRequest(config, entry, rows, types, signal, preflight, diagnost
 }
 async function scAutoCreate(msg, sender) {
   aiSource(sender);
-  if (!/^[a-f0-9-]{36}$/.test(msg.packageId) || !Array.isArray(msg.entries) || !msg.entries.length || msg.entries.length > 10) throw new Error('Неверный пакет');
+  if (!/^[a-f0-9-]{36}$/.test(msg.packageId) || !Array.isArray(msg.entries) || !msg.entries.length) throw new Error('Неверный пакет');
   const ai = await aiConfig(); await aiPermission(ai);
   const c = await scConfig(), binding = await scBinding(c);
   PM_DIAG.addSecrets([ai.key, c.key]);
@@ -320,7 +320,57 @@ async function aiCancel(msg, sender) {
     await scSave(pack); return {};
   });
 }
+async function aiManual(msg, sender) {
+  if (!scPage(sender, 'review.html')) throw new Error('Откройте страницу результатов');
+  const pack = await scPackage(msg.id);
+  const entry = pack.entries.find(e => e.bidId === msg.bidId);
+  if (!pack.auto || !entry || entry.status === '4') throw new Error('Заявка недоступна');
+  if (entry.extractionState === 'pending' || aiRuns.get(pack.id)?.tasks.has(entry.bidId)) throw new Error('Дождитесь завершения извлечения этой поставки');
+  if (pack.binding !== await scBinding(await scConfig())) throw new Error('Настройки магазина изменились');
+  const { rows } = await scSource(pack, 'account-preview', entry);
+  if (!Array.isArray(rows) || !rows.length || rows.some(r => typeof r !== 'string' || !r.trim() || r.length > 64000)) throw new Error('Нет полных строк в исходной вкладке или превышен размер строки');
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(rows)));
+  const digest = Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
+  if (entry.previewDigest && entry.previewDigest !== digest) throw new Error('Предпросмотр изменился. Повторите извлечение перед выбором столбца');
+  const indexes = rows.map((_, i) => i).filter(i => !(entry.extractedIndexes || []).includes(i));
+  if (!indexes.length) throw new Error('Все строки уже распознаны');
+  const types = PM_SOCIAL.types(await PM_DB.get('catalog'), entry.platform);
+  if (msg.action === 'ai-manual-preview') return {
+    rows: indexes.map(index => ({ index, value: rows[index] })), digest, runId: pack.runId, types, platform: entry.platform,
+  };
+  if (msg.digest !== digest || msg.runId !== pack.runId) throw new Error('Данные изменились. Откройте выбор столбца заново');
+  if (!types.includes(msg.type)) throw new Error('Способ поиска отключён в каталоге');
+  const selected = PM_SOCIAL.manualColumn(rows, indexes, msg.delimiter, msg.column, entry.platform, msg.type);
+  if (!selected.some(item => item.identifier)) throw new Error('В выбранном столбце нет корректных логинов / ID');
+  return scExclusive(async () => {
+    const latest = await scPackage(pack.id), target = latest.entries.find(e => e.bidId === entry.bidId);
+    if (!target || latest.runId !== pack.runId || target.status !== entry.status ||
+        target.extractionState === 'pending' || aiRuns.get(pack.id)?.tasks.has(entry.bidId) ||
+        latest.binding !== await scBinding(await scConfig()) ||
+        (target.previewDigest && target.previewDigest !== digest)) throw new Error('Поставка изменилась. Откройте выбор столбца заново');
+    const done = new Set(target.extractedIndexes || []);
+    let added = 0;
+    for (const { index, identifier } of selected) {
+      if (!identifier || done.has(index)) continue;
+      if (!target.jobs.some(j => j.query.identifier_type === msg.type && j.query.identifier === identifier)) {
+        target.jobs.push({ query: { platform: target.platform, identifier_type: msg.type, identifier }, key: crypto.randomUUID() });
+        added++;
+      }
+      done.add(index);
+    }
+    target.previewDigest = digest; target.pageRows = rows.length;
+    target.extractedIndexes = [...done];
+    target.extractionIssues = rows.flatMap((_, i) => done.has(i) ? [] : [`Строка ${i + 1}: логин не определён`]);
+    target.extractionComplete = !target.extractionIssues.length;
+    target.extractionState = target.jobs.length ? 'ready' : 'error';
+    target.extractionError = target.extractionIssues.length ? `Осталось нераспознанных строк: ${target.extractionIssues.length}` : '';
+    target.manualColumn = { delimiter: msg.delimiter, column: msg.column, type: msg.type };
+    await scSave(latest);
+    return { added, remaining: target.extractionIssues.length };
+  });
+}
 async function aiHandle(msg, sender) {
+  if (['ai-manual-preview', 'ai-manual-apply'].includes(msg.action)) return aiManual(msg, sender);
   if (msg.action === 'ai-extract') return aiExtract(msg, sender);
   if (msg.action === 'ai-cancel') return aiCancel(msg, sender);
   if (msg.action === 'ai-entry-error') {

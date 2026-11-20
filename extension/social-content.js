@@ -29,7 +29,7 @@ function pmSocialButton(panel) {
   const button = document.createElement('button');
   button.className = 'pm-filter-btn pm-filter-social-btn';
   button.textContent = 'Подготовить проверку';
-  button.title = available.reason || 'Первые 10 видимых поставок: аккаунты из разметки → ИИ → Social Check';
+  button.title = available.reason || 'Все видимые отфильтрованные поставки: аккаунты из разметки → ИИ → Social Check';
   button.disabled = !!pmBusy || pmSocialPreparing || !available.platform;
   button.onclick = pmSocialPrepare;
   panel.append(button);
@@ -120,7 +120,7 @@ async function pmSocialPrepare() {
     const platform = pmSocialPlatform();
     if (!platform) throw new Error(pmSocialAvailability().reason);
     const items = pmSelectableRows().filter(b => !b.row.hidden && !b.row.classList.contains('pm-hidden-by-filter') && getComputedStyle(b.row).display !== 'none')
-      .slice(0, 10).map(b => pmSocialMetadata(b, platform));
+      .map(b => pmSocialMetadata(b, platform));
     if (!items.length) return;
     const packageId = crypto.randomUUID();
     // Only compact supplier metadata is persisted; full rows travel separately and transiently.
@@ -201,6 +201,11 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       pmSocialPackages.set(msg.packageId, new Map(msg.entries.map(e => [e.bidId, e.status]))); return {};
     }
     if (msg.command === 'snapshot') return { entries: msg.entries.map(e => ({ bidId: e.bidId, status: pmSocialCurrent(e.bidId)?.select.value ?? null })) };
+    if (msg.command === 'account-preview') {
+      const entry = msg.entries.find(e => e.bidId === msg.bidId && e.status === msg.status);
+      if (!entry) throw new Error('Заявка не входит в пакет');
+      return pmSocialAccountPreview(entry);
+    }
     if (msg.command === 'prepare-auto') {
       if (pmBusy || document.querySelector('.pm-modal-backdrop')) throw new Error('Завершите подготовку в исходной вкладке');
       const items = msg.entries.map(entry => {
