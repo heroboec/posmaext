@@ -51,7 +51,7 @@ function aiParse(json, rows, platform, types) {
   let data;
   try { data = JSON.parse(json.choices[0].message.content); } catch (_) { throw new Error('ИИ вернул некорректный JSON'); }
   if (!Array.isArray(data.accounts) || data.accounts.length !== rows.length) throw new Error('ИИ вернул неполный ответ');
-  const seen = new Set(), jobs = [], issues = [];
+  const seen = new Set(), jobs = [], issues = [], resolved = [];
   for (const item of data.accounts) {
     if (!Number.isInteger(item.index) || item.index < 0 || item.index >= rows.length || seen.has(item.index)) throw new Error('ИИ перепутал строки');
     seen.add(item.index);
@@ -68,11 +68,12 @@ function aiParse(json, rows, platform, types) {
       at = raw.indexOf(identifier, at + 1);
     }
     if (!found) throw new Error('Идентификатор ИИ отсутствует в исходной строке');
+    resolved.push(item.index);
     if (!jobs.some(j => j.query.identifier_type === item.type && j.query.identifier === identifier)) {
       jobs.push({ query: { platform, identifier_type: item.type, identifier }, key: crypto.randomUUID() });
     }
   }
-  return { jobs, issues };
+  return { jobs, issues, resolved };
 }
 async function aiRequest(config, entry, rows, types, signal, preflight) {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -126,7 +127,7 @@ async function scAutoCreate(msg, sender) {
       return { bidId: e.bidId, status: text(e.status), category: text(e.category), subcategory: text(e.subcategory),
         platform: e.platform, title: text(e.title), description: text(e.description), format: text(e.format),
         properties: (e.properties || []).slice(0, 100).map(p => ({ label: text(p.label), value: text(p.value) })),
-        extractionState: 'pending', jobs: [] };
+        extractionState: 'pending', extractionComplete: false, jobs: [] };
     });
     if (new Set(entries.map(e => e.bidId)).size !== entries.length) throw new Error('Повтор заявки');
     pack = { id: msg.packageId, created: Date.now(), origin: new URL(sender.url).origin, tabId: sender.tab.id,
@@ -135,14 +136,17 @@ async function scAutoCreate(msg, sender) {
     await PM_DB.set('packages', [...await PM_DB.get('packages') || [], pack.id]);
   }
   aiRuns.get(pack.id)?.controller.abort();
+  if (pack.previewMode !== 'all') {
+    pack.previewMode = 'all';
+    for (const entry of pack.entries) { entry.extractionComplete = false; entry.extractedIndexes = []; }
+  }
   const runId = crypto.randomUUID();
   aiRuns.set(pack.id, { runId, controller: new AbortController(), tasks: new Map() });
   pack.runId = runId; pack.aiPaused = false;
-  for (const entry of pack.entries) if (!entry.jobs.length || entry.extractionIssues?.length) { entry.extractionState = 'pending'; entry.extractionError = ''; }
+  for (const entry of pack.entries) if (!entry.extractionComplete || !entry.jobs.length || entry.extractionIssues?.length) { entry.extractionState = 'pending'; entry.extractionError = ''; }
   await scSave(pack);
   if (fresh) await chrome.tabs.create({ url: chrome.runtime.getURL('review.html') + '?id=' + pack.id, index: sender.tab.index + 1, openerTabId: sender.tab.id });
-  return { id: pack.id, runId, ready: pack.entries.filter(e => e.jobs.length && !e.extractionIssues?.length).map(e => e.bidId),
-    samples: Object.fromEntries(pack.entries.filter(e => e.sampleIndexes).map(e => [e.bidId, e.sampleIndexes])) };
+  return { id: pack.id, runId, ready: pack.entries.filter(e => e.extractionComplete && e.jobs.length && !e.extractionIssues?.length).map(e => e.bidId) };
 }
 async function aiExtract(msg, sender) {
   const pack = await scPackage(msg.id); aiOwn(pack, sender);
@@ -151,19 +155,23 @@ async function aiExtract(msg, sender) {
   if (pack.binding !== await scBinding(await scConfig())) throw new Error('Настройки магазина изменились');
   const entry = pack.entries.find(e => e.bidId === msg.bidId);
   if (!entry || entry.status === '4') throw new Error('Заявка недоступна');
-  if (entry.jobs.length && !entry.extractionIssues?.length) return { count: entry.jobs.length };
   if (run.tasks.has(entry.bidId)) return run.tasks.get(entry.bidId);
   const task = (async () => {
-    let release;
     try {
       const rows = msg.rows;
-      if (!Array.isArray(rows) || !rows.length || rows.length > 2 || rows.some(r => typeof r !== 'string' || !r.trim() || r.length > 64000)) throw new Error('В разметке нет полных строк или превышен размер строки (64 000 символов)');
-      const indexes = msg.sampleIndexes ?? rows.map((_, i) => i);
-      if (!Array.isArray(indexes) || indexes.length !== rows.length || indexes.some(i => !Number.isInteger(i) || i < 0 || i > 1000000)) throw new Error('Некорректные номера строк');
+      if (!Array.isArray(rows) || !rows.length || rows.some(r => typeof r !== 'string' || !r.trim() || r.length > 64000)) throw new Error('В разметке нет полных строк или превышен размер строки (64 000 символов)');
+      const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(rows)));
+      const digest = Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
+      let extracted = [];
       await scExclusive(async () => {
         const latest = await scPackage(pack.id);
         if (latest.runId !== run.runId || latest.aiPaused) throw new Error('Подготовка отменена');
-        latest.entries.find(e => e.bidId === entry.bidId).sampleIndexes = indexes;
+        const target = latest.entries.find(e => e.bidId === entry.bidId);
+        if (target.previewDigest !== digest) { target.previewDigest = digest; target.extractedIndexes = []; }
+        extracted = target.extractedIndexes || [];
+        target.extractionIssues = []; target.extractionError = '';
+        target.pageRows = rows.length; target.extractionComplete = false;
+        delete target.sampleIndexes;
         await scSave(latest);
       });
       const config = await aiConfig(), signal = run.controller.signal;
@@ -175,25 +183,58 @@ async function aiExtract(msg, sender) {
         if (snapshot.entries.find(e => e.bidId === entry.bidId)?.status !== entry.status) throw new Error('Строка или статус изменились. Сверьте статусы');
         signal.throwIfAborted();
       };
-      release = await aiSlot(config, signal);
-      const result = await aiRequest(config, entry, rows, PM_SOCIAL.types(await PM_DB.get('catalog'), entry.platform), signal, preflight);
+      // Bound each model response, not the number of accounts checked. Persist each
+      // completed chunk immediately so other accounts can already reach Social Check.
+      const chunks = [];
+      let chunk = [], size = 0;
+      const done = new Set(extracted);
+      rows.forEach((row, index) => {
+        if (done.has(index)) return;
+        if (chunk.length && (chunk.length >= 10 || size + row.length > 64000)) {
+          chunks.push(chunk); chunk = []; size = 0;
+        }
+        chunk.push(index); size += row.length;
+      });
+      if (chunk.length) chunks.push(chunk);
+      const failures = [];
+      await Promise.all(Array.from({ length: Math.min(chunks.length, config.concurrency) }, async () => {
+        while (chunks.length && !signal.aborted) {
+          const indexes = chunks.shift();
+          let release;
+          try {
+            release = await aiSlot(config, signal);
+            const result = await aiRequest(config, entry, indexes.map(i => rows[i]), PM_SOCIAL.types(await PM_DB.get('catalog'), entry.platform), signal, preflight);
+            await preflight();
+            await scExclusive(async () => {
+              const latest = await scPackage(pack.id), target = latest.entries.find(e => e.bidId === entry.bidId);
+              if (signal.aborted || latest.runId !== run.runId || latest.aiPaused || target.status !== entry.status ||
+                  latest.binding !== await scBinding(await scConfig())) throw new Error('Подготовка отменена или статус изменился');
+              for (const job of result.jobs) {
+                if (!target.jobs.some(j => j.query.identifier_type === job.query.identifier_type && j.query.identifier === job.query.identifier)) target.jobs.push(job);
+              }
+              target.extractedIndexes = [...new Set([...(target.extractedIndexes || []), ...result.resolved.map(i => indexes[i])])];
+              target.extractionIssues.push(...result.issues.map(issue => issue.replace(/^Строка (\d+):/, (_, n) => `Строка ${indexes[Number(n) - 1] + 1}:`)));
+              await scSave(latest);
+            });
+          } catch (error) { failures.push(error.message); }
+          finally { release?.(); }
+        }
+      }));
       await preflight();
-      signal.throwIfAborted();
+      let count = 0;
       await scExclusive(async () => {
         const latest = await scPackage(pack.id), target = latest.entries.find(e => e.bidId === entry.bidId);
         if (latest.runId !== run.runId || latest.aiPaused || target.status !== entry.status ||
             latest.binding !== await scBinding(await scConfig())) throw new Error('Подготовка отменена или статус изменился');
-        // Keep completed jobs and their keys when retrying a partially parsed entry.
-        for (const job of result.jobs) {
-          if (target.jobs.length < 2 && !target.jobs.some(j => j.query.identifier_type === job.query.identifier_type && j.query.identifier === job.query.identifier)) target.jobs.push(job);
-        }
-        target.extractionIssues = result.issues;
-        target.pageRows = Math.max(rows.length, Math.min(1000000, Number(msg.pageRows) || rows.length));
-        target.extractionState = target.jobs.length ? 'ready' : 'error';
-        target.extractionError = target.jobs.length ? '' : 'Логин не удалось определить по названию, формату и строке';
+        count = target.jobs.length;
+        target.extractionComplete = !failures.length;
+        target.extractionState = failures.length || !count ? 'error' : 'ready';
+        target.extractionError = failures.length ? `Не обработано частей предпросмотра: ${failures.length}. ${failures[0]}` :
+          count ? '' : 'Логин не удалось определить по названию, формату и строке';
         await scSave(latest);
       });
-      return { count: result.jobs.length };
+      if (failures.length) throw new Error(failures[0]);
+      return { count };
     } catch (e) {
       await scExclusive(async () => {
         const latest = await PM_DB.get('package:' + pack.id);
@@ -205,7 +246,7 @@ async function aiExtract(msg, sender) {
         }
       });
       throw new Error(run.controller.signal.aborted ? 'Подготовка отменена' : e.message);
-    } finally { release?.(); }
+    }
   })();
   run.tasks.set(entry.bidId, task);
   task.then(() => run.tasks.delete(entry.bidId), () => run.tasks.delete(entry.bidId));

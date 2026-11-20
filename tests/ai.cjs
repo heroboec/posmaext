@@ -184,11 +184,12 @@ test('AI: a new run rejects late extraction results from the previous run', asyn
 
 test('AI: partial extraction can be retried without losing an already completed check', async () => {
   const w = setup(); await w.configure(); const run = await w.create(); let partial = true;
-  w.ctx.fetch = async () => ({ ok: true, status: 200, headers: new Headers(), json: async () => ({
-    choices: [{ message: { content: JSON.stringify({ accounts: [
-      { index: 0, type: 'username', identifier: 'test_user' },
-      { index: 1, type: 'username', identifier: partial ? null : 'test_second' },
-    ] }) } }],
+  w.ctx.fetch = async (url, init) => ({ ok: true, status: 200, headers: new Headers(), json: async () => ({
+    choices: [{ message: { content: JSON.stringify({ accounts:
+      JSON.parse(JSON.parse(init.body).messages[1].content).rows.map((row, index) => ({
+        index, type: 'username', identifier: partial && row.value.startsWith('test_second:') ? null : row.value.split(':')[0],
+      })),
+    }) } }],
   }) });
   const rows = ['test_user:SYNTHETIC_PASSWORD', 'test_second:SECOND_SYNTHETIC_PASSWORD'];
   assert.equal((await w.extract(run, '42', rows)).ok, true);
@@ -241,4 +242,90 @@ test('AI: an email local-part or domain cannot be substituted for a social login
     assert.equal((await w.extract(run, '42', ['test_user@example.test:SYNTHETIC_PASSWORD'])).ok, false);
     assert.equal((await w.ctx.db.get('package:' + run.id)).entries[0].jobs.length, 0);
   }
+});
+
+test('all preview: every row is extracted in bounded chunks with no two-account limit', async () => {
+  const w = setup(); await w.configure(); const run = await w.create(), sizes = [];
+  const rows = Array.from({ length: 23 }, (_, i) => `preview_user_${i}:SYNTHETIC_PASSWORD`);
+  w.ctx.fetch = async (url, init) => {
+    const input = JSON.parse(JSON.parse(init.body).messages[1].content).rows;
+    sizes.push(input.length);
+    return { ok: true, status: 200, headers: new Headers(), json: async () => ({
+      choices: [{ message: { content: JSON.stringify({ accounts: input.map((row, index) => ({
+        index, type: 'username', identifier: row.value.split(':')[0],
+      })) }) } }],
+    }) };
+  };
+  assert.equal((await w.extract(run, '42', rows)).ok, true);
+  const pack = await w.ctx.db.get('package:' + run.id), entry = pack.entries[0];
+  assert.equal(entry.jobs.length, 23);
+  assert.deepEqual([...sizes].sort((a,b) => a-b), [3,10,10]);
+  assert.deepEqual(new Set(entry.jobs.map(j => j.query.identifier)),
+    new Set(Array.from({ length: 23 }, (_, i) => `preview_user_${i}`)));
+  assert.equal(entry.extractionComplete, true);
+  assert.equal(entry.pageRows, 23);
+  assert.doesNotMatch(JSON.stringify(pack), /SYNTHETIC_PASSWORD/);
+});
+
+test('all preview: retry sends only failed chunks and keeps completed Social Check keys', async () => {
+  const w = setup(); await w.configure(); const run = await w.create();
+  const rows = Array.from({ length: 13 }, (_, i) => `preview_user_${i}:SYNTHETIC_PASSWORD`);
+  const inputs = []; let failing = true;
+  w.ctx.fetch = async (url, init) => {
+    const input = JSON.parse(JSON.parse(init.body).messages[1].content).rows;
+    inputs.push(input.map(r => r.value.split(':')[0]));
+    if (failing && input[0].value.startsWith('preview_user_10:')) return { ok: false, status: 503, headers: new Headers() };
+    return { ok: true, status: 200, headers: new Headers(), json: async () => ({
+      choices: [{ message: { content: JSON.stringify({ accounts: input.map((row, index) => ({
+        index, type: 'username', identifier: row.value.split(':')[0],
+      })) }) } }],
+    }) };
+  };
+  assert.equal((await w.extract(run, '42', rows)).ok, false);
+  const before = (await w.ctx.db.get('package:' + run.id)).entries[0];
+  assert.equal(before.jobs.length, 10); assert.equal(before.extractionComplete, false);
+  const restart = await w.send({ action: 'sc-auto-create', packageId: run.id, entries: [{ bidId: '42' }] });
+  assert.equal(restart.ready.length, 0);
+  failing = false; inputs.length = 0;
+  assert.equal((await w.extract(restart, '42', rows)).ok, true);
+  assert.deepEqual(inputs, [['preview_user_10', 'preview_user_11', 'preview_user_12']]);
+  const after = (await w.ctx.db.get('package:' + run.id)).entries[0];
+  assert.equal(after.jobs.length, 13);
+  assert.deepEqual(after.jobs.slice(0, 10).map(j => j.key), before.jobs.map(j => j.key));
+});
+
+test('all preview: resuming an old two-account package expands it without replacing job keys', async () => {
+  const w = setup(); await w.configure(); const run = await w.create();
+  w.ctx.fetch = async (url, init) => {
+    const input = JSON.parse(JSON.parse(init.body).messages[1].content).rows;
+    return { ok: true, status: 200, headers: new Headers(), json: async () => ({
+      choices: [{ message: { content: JSON.stringify({ accounts: input.map((row, index) => ({
+        index, type: 'username', identifier: row.value.split(':')[0],
+      })) }) } }],
+    }) };
+  };
+  const rows = Array.from({ length: 5 }, (_, i) => `preview_user_${i}:SYNTHETIC_PASSWORD`);
+  await w.extract(run, '42', rows.slice(0, 2));
+  const old = await w.ctx.db.get('package:' + run.id);
+  const keys = old.entries[0].jobs.map(j => j.key);
+  delete old.previewMode; delete old.entries[0].extractionComplete;
+  await w.ctx.db.set('package:' + run.id, old);
+  const restart = await w.send({ action: 'sc-auto-create', packageId: run.id, entries: [{ bidId: '42' }] });
+  assert.equal(restart.ready.length, 0);
+  assert.equal((await w.extract(restart, '42', rows)).ok, true);
+  const entry = (await w.ctx.db.get('package:' + run.id)).entries[0];
+  assert.equal(entry.jobs.length, 5);
+  assert.deepEqual(entry.jobs.slice(0, 2).map(j => j.key), keys);
+});
+
+test('all preview: cancellation stops pending chunks within the same bid', async () => {
+  const w = setup(); await w.configure(); const run = await w.create(), pending = [];
+  w.ctx.fetch = (url, init) => new Promise(resolve => pending.push({ resolve, init }));
+  const request = w.extract(run, '42', Array.from({ length: 25 }, (_, i) => `preview_user_${i}:SYNTHETIC_PASSWORD`));
+  for (let i = 0; i < 100 && pending.length < 2; i++) await settle();
+  assert.equal(pending.length, 2);
+  await w.send({ action: 'ai-cancel', id: run.id, runId: run.runId });
+  for (const req of pending) req.resolve({ ok: true, json: async () => ({}) });
+  assert.equal((await request).ok, false);
+  assert.equal(pending.length, 2, 'The third chunk must not be sent after cancellation');
 });

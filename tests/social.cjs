@@ -331,6 +331,30 @@ test('automation: scoped format and description, missing format still passes tit
     assert.equal(s.requests.length, 0);
   } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
 });
+test('automation: every full account in the preview is sent, not a random pair', async () => {
+  const s = content();
+  try {
+    await settle();
+    const tr = s.w.document.getElementById('status_id42').closest('tr');
+    tr.querySelector('td').insertAdjacentHTML('beforeend', `<div class="section-accounts-js-42">
+      ${Array.from({ length: 7 }, (_, i) => `<span data-account-full="preview_user_${i}:SYNTHETIC_PASSWORD">short…</span>`).join('')}
+    </div>`);
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    const sent = s.messages.find(m => m.action === 'ai-extract');
+    assert.equal(sent.pageRows, 7);
+    // The runtime releases transient raw strings after receiving a response; capture
+    // them at the messaging boundary in the second run.
+    const send = s.w.chrome.runtime.sendMessage, copies = [];
+    s.w.chrome.runtime.sendMessage = msg => {
+      if (msg.action === 'ai-extract') copies.push(Array.from(msg.rows));
+      return send(msg);
+    };
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    assert.deepEqual(copies[0], Array.from({ length: 7 }, (_, i) => `preview_user_${i}:SYNTHETIC_PASSWORD`));
+    assert.equal(s.requests.length, 0);
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
 test('automation: cancellation tells worker to stop and ignores late replies', async () => {
   const s = content();
   try {

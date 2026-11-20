@@ -66,19 +66,13 @@ function pmSocialMetadata(item, platform) {
     subcategory: (item.row.querySelector('[data-section-subcategory]')?.textContent || categorySpans[1]?.textContent || '').replace(/^[\s\\/]+/, '').trim(),
     platform, title, description, format, properties };
 }
-function pmSocialAccountSample(item, savedIndexes) {
+function pmSocialAccountPreview(item) {
   // Never read another bid's preview, the shortened visible text or arbitrary data-value.
   const current = pmSocialCurrent(item.bidId);
   if (!current || current.select.value !== item.status || item.status === '4') throw new Error('Строка или статус изменились');
   const rows = [...new Set([...current.row.querySelectorAll(`.section-accounts-js-${item.bidId} [data-account-full]`)]
     .map(node => node.getAttribute('data-account-full')).filter(value => typeof value === 'string' && value.trim()))];
-  const indexes = rows.map((_, i) => i);
-  for (let i = indexes.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1)); [indexes[i], indexes[j]] = [indexes[j], indexes[i]];
-  }
-  const sampleIndexes = savedIndexes || indexes.slice(0, 2);
-  if (sampleIndexes.some(i => !Number.isInteger(i) || i < 0 || i >= rows.length)) throw new Error('Выбранные строки больше не доступны в разметке. Создайте новый пакет');
-  return { rows: sampleIndexes.map(i => rows[i]), pageRows: rows.length, sampleIndexes };
+  return { rows, pageRows: rows.length };
 }
 async function pmSocialAdminFetch(body) {
   const csrf = pmGetCsrf();
@@ -184,7 +178,7 @@ function pmSocialAutomation(items, packageId, initialRun) {
         states.set(item.bidId, { state: 'pending' }); render();
         let sample;
         try {
-          sample = pmSocialAccountSample(item, run.samples?.[item.bidId]);
+          sample = pmSocialAccountPreview(item);
           const response = await pmSocialMessage({ action: 'ai-extract', id: packageId, runId: run.runId, bidId: item.bidId, ...sample });
           if (!closed) states.set(item.bidId, response.count ? { state: 'ready' } : { state: 'error', error: 'Логин не определён' });
         } catch (e) {
