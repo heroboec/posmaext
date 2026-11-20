@@ -115,9 +115,11 @@ async function scSource(pack, command, entry, message) {
   return result;
 }
 async function scHandle(msg, sender) {
+  if (msg.action === 'sc-auto-create') return scAutoCreate(msg, sender);
   if (msg.action === 'sc-public') {
     const c = await scConfig();
-    return { mapping: c.mapping, interval: c.interval, catalog: await PM_DB.get('catalog') || [] };
+    return { mapping: c.mapping, interval: c.interval, catalog: await PM_DB.get('catalog') || [],
+      aiConcurrency: typeof aiConfig === 'function' ? (await aiConfig()).concurrency : 3 };
   }
   if (['sc-draft-get', 'sc-draft-save', 'sc-draft-delete'].includes(msg.action)) {
     if (!sender.tab || sender.frameId !== 0 || !/^https?:/.test(sender.url || '')) throw new Error('Нужна исходная страница');
@@ -198,9 +200,15 @@ async function scHandle(msg, sender) {
   const pack = await scPackage(msg.id);
   if (msg.action === 'sc-get') return { package: pack, sameStore: pack.binding === await scBinding(await scConfig()) };
   if (msg.action === 'sc-delete') {
+    if (typeof aiRuns !== 'undefined') { aiRuns.get(pack.id)?.controller.abort(); aiRuns.delete(pack.id); }
     await PM_DB.delete('package:' + pack.id);
     await PM_DB.set('packages', (await PM_DB.get('packages') || []).filter(id => id !== pack.id));
     return {};
+  }
+  if (msg.action === 'sc-auto-retry') {
+    if (!pack.auto || !scPage(sender, 'review.html')) throw new Error('Откройте автоматический пакет');
+    // Release the worker's state lock before the content script creates the new run.
+    return () => scSource(pack, 'prepare-auto');
   }
   if (msg.action === 'sc-reconnect') {
     const tabId = Number(msg.tabId);
@@ -258,6 +266,11 @@ async function scRunCheck(msg, pack, entry, job, owner) {
     const request = { owner, binding: pack.binding, preflight: async () => {
       const latest = await scPackage(pack.id);
       if (latest.entries.find(e => e.bidId === entry.bidId)?.jobs[msg.job]?.key !== job.key) throw new Error('Проверка в пакете изменилась');
+      if (latest.auto && msg.action === 'sc-submit') {
+        if (latest.aiPaused && !msg.manual) throw new Error('Подготовка приостановлена. Повторите извлечение или продолжите вручную');
+        const snapshot = await scSource(latest, 'snapshot');
+        if (snapshot.entries.find(e => e.bidId === entry.bidId)?.status !== entry.status) throw new Error('Строка или статус изменились. Сверьте статусы перед проверкой');
+      }
     } };
     const check = msg.action === 'sc-submit'
       ? await scApi('checks', { ...request, method: 'POST', query: job.query, key: job.key })

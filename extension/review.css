@@ -6,5 +6,13 @@ button:disabled { opacity:.5; cursor:default; } button:focus-visible,a:focus-vis
 article { padding:22px; margin:20px 0; border:1px solid #dbe2ed; border-radius:12px; background:white; }
 table { width:100%; border-collapse:collapse; margin:14px 0; } td,th { text-align:left; padding:9px; border:1px solid #dbe2ed; overflow-wrap:anywhere; white-space:pre-wrap; }
 th { background:#f1f5f9; } .scroll { overflow:auto; } .hint { color:#64748b; } #notice,.error { color:#b91c1c; white-space:pre-wrap; }
-.checks { display:grid; gap:14px; } .check { padding:14px; background:#f1f5f9; border-radius:8px; min-width:0; overflow-wrap:anywhere; }
 .decline { color:#b91c1c; } .accept { color:#166534; } #summary { font-weight:600; }
+.description { white-space: pre-wrap; line-height: 1.5; }
+.accounts-table .login { font-weight: 600; white-space: nowrap; }
+.accounts-table td { vertical-align: top; white-space: nowrap; overflow-wrap: normal; }
+.accounts-table { min-width: 1000px; font-size: 13px; }
+.accounts-table th { white-space: nowrap; }
+.accounts-table td:nth-child(2) { min-width: 170px; white-space: normal; }
+.accounts-table td:last-child { min-width: 280px; white-space: normal; overflow-wrap: anywhere; }
+.accounts-table th:first-child,.accounts-table td:first-child { position: sticky; left: 0; z-index: 1; background: white; }
+.accounts-table th:first-child { background: #f1f5f9; z-index: 2; }

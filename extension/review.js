@@ -22,7 +22,10 @@ function scReviewConnect() {
     if (!scReviewClosed && !scReviewStop) setTimeout(scReviewConnect, 500);
   });
 }
-window.addEventListener('pagehide', () => { scReviewClosed = true; scReviewStop = true; scReviewPort?.disconnect(); });
+window.addEventListener('pagehide', () => {
+  scReviewClosed = true; scReviewStop = true; scReviewPort?.disconnect();
+  if (scReviewPack?.auto) scReviewMessage({ action: 'ai-cancel' }).catch(() => {});
+});
 async function scReviewLoad() {
   const result = await scReviewMessage({ action: 'sc-get' });
   scReviewPack = result.package; scReviewSameStore = result.sameStore; scReviewRender();
@@ -33,35 +36,50 @@ function scReviewRender() {
     (scReviewSameStore ? '' : ' · URL/ключ магазина изменились — запросы API заблокированы');
   for (const id of ['check', 'refresh', 'sync', 'reconnect', 'delete']) document.getElementById(id).disabled = scReviewBusy || (['check', 'refresh'].includes(id) && !scReviewSameStore);
   document.getElementById('stop').disabled = !scReviewBusy;
+  document.getElementById('retry-ai').hidden = !scReviewPack.auto;
+  document.getElementById('retry-ai').disabled = scReviewBusy;
+  if (scReviewPack.auto && !scReviewPack.aiPaused) document.getElementById('stop').disabled = false;
   const main = document.getElementById('entries'); main.replaceChildren();
   for (const entry of scReviewPack.entries) {
     const article = scNode('article', undefined, main);
     scNode('h2', `Заявка #${entry.bidId} — ${scBidStatuses[entry.status] || entry.status}`, article);
     scNode('p', `${entry.category} / ${entry.subcategory || 'Подкатегория не указана'}`, article);
-    scNode('p', `Столбец ${entry.column + 1} · ${entry.type === 'id' ? 'ID' : 'Юзернейм'} · ${entry.jobs.length} из ${entry.pageRows} строк одной страницы`, article);
+    if (entry.title) scNode('h3', entry.title, article);
+    const description = entry.description || entry.properties.find(p => p.label.replace(/[:\s]+$/, '') === 'Описание товара')?.value;
+    scNode('p', description || 'Описание товара в разметке не найдено', article).className = 'description';
+    scNode('p', `${entry.jobs.length} аккаунтов · ${entry.pageRows ?? '—'} полных строк в разметке`, article);
+    if (entry.extractionState === 'pending') scNode('p', 'ИИ определяет логины… Если подготовка прервана, нажмите «Повторить извлечение».', article);
+    if (entry.extractionError) scNode('p', entry.extractionError, article).className = 'error';
     if (entry.sourceStatus !== undefined && entry.sourceStatus !== entry.status) scNode('p', entry.sourceStatus === null ? 'Строка отсутствует в исходном списке' : `Конфликт: в админке статус ${scBidStatuses[entry.sourceStatus] || entry.sourceStatus}. Решение заблокировано`, article).className = 'error';
-    const checks = scNode('div', undefined, article); checks.className = 'checks';
-    entry.jobs.forEach((job, i) => {
-      const card = scNode('section', undefined, checks); card.className = 'check';
-      scNode('h3', `Аккаунт ${i + 1}: ${job.query.identifier}`, card);
-      scNode('p', job.check ? PM_SOCIAL.statuses[job.check.status] : job.attempted ? 'Отправка не подтверждена' : 'Ещё не отправлен', card);
-      if (job.check?.id) scNode('p', `Проверка: ${job.check.id}`, card);
-      if (job.check?.reason) scNode('p', scReasons[job.check.reason] || 'Источник не предоставил результат', card);
-      if (job.check?.previously_requested !== null && job.check?.previously_requested !== undefined) scNode('p', `Запрашивался ранее: ${job.check.previously_requested ? 'Да' : 'Нет'}`, card);
-      if (job.check?.result?.source_observed_at) scNode('p', `Данные источника: ${job.check.result.source_observed_at}`, card);
-      if (job.error) scNode('p', job.error, card).className = 'error';
-      scNode('h4', 'Данные аккаунта', card);
-      const scroll = scNode('div', undefined, card); scroll.className = 'scroll';
-      const table = scNode('table', undefined, scroll), head = scNode('tr', undefined, scNode('thead', undefined, table));
-      ['Свойство', 'Данные аккаунта'].forEach(t => scNode('th', t, head));
-      const body = scNode('tbody', undefined, table);
-      // Each account has its own results; supplier properties remain separate below.
-      for (const [field, label] of Object.entries(PM_SOCIAL.fields)) {
-        if (['avatar_url', 'profile_url', 'display_name', 'username', 'bio'].includes(field)) continue;
-        const tr = scNode('tr', undefined, body);
-        [label, scValue(job.check?.result?.data?.[field])].forEach(v => scNode('td', v, tr));
-      }
-    });
+    const fields = Object.entries(PM_SOCIAL.fields).filter(([field]) =>
+      !['avatar_url', 'profile_url', 'display_name', 'username', 'bio'].includes(field));
+    const scroll = scNode('div', undefined, article); scroll.className = 'scroll';
+    const table = scNode('table', undefined, scroll); table.className = 'accounts-table';
+    const head = scNode('tr', undefined, scNode('thead', undefined, table));
+    ['Логин / ID', 'Состояние', ...fields.map(([, label]) => label), 'Подробности / ошибка'].forEach(label => scNode('th', label, head));
+    const body = scNode('tbody', undefined, table);
+    for (const job of entry.jobs) {
+      const tr = scNode('tr', undefined, body);
+      scNode('td', job.query.identifier, tr).className = 'login';
+      scNode('td', job.check ? PM_SOCIAL.statuses[job.check.status] || job.check.status :
+        job.attempted ? 'Отправка не подтверждена' : 'Ожидает отправки', tr);
+      for (const [field] of fields) scNode('td', scValue(job.check?.result?.data?.[field]), tr);
+      const detail = [
+        job.check?.id ? `Проверка: ${job.check.id}` : '',
+        job.check?.reason ? scReasons[job.check.reason] || 'Источник не предоставил результат' : '',
+        job.check?.result?.source_observed_at ? `Данные источника: ${job.check.result.source_observed_at}` : '',
+        job.check?.previously_requested != null ? `Запрашивался ранее: ${job.check.previously_requested ? 'Да' : 'Нет'}` : '',
+        job.error || '',
+      ].filter(Boolean).join(' · ');
+      scNode('td', detail || '—', tr).className = job.error ? 'error' : '';
+    }
+    const issues = entry.extractionIssues?.length ? entry.extractionIssues :
+      !entry.jobs.length && entry.extractionError ? [entry.extractionError] : [];
+    for (const issue of issues) {
+      const tr = scNode('tr', undefined, body);
+      scNode('td', 'Не определён', tr);
+      const cell = scNode('td', issue, tr); cell.colSpan = fields.length + 2; cell.className = 'error';
+    }
     scNode('h3', 'Исходные свойства поставщика', article);
     if (!entry.properties.length) scNode('p', 'В доступной разметке свойства не найдены', article);
     else {
@@ -90,7 +108,7 @@ async function scReviewDecision(entry, decision) {
   catch (e) { scNotice(e.message); }
   finally { scReviewBusy = false; await scReviewLoad(); }
 }
-async function scReviewQueue(action) {
+async function scReviewQueue(action, automatic = false) {
   if (scReviewBusy || !scReviewSameStore) return;
   if (scReviewStop) scReviewConnect();
   scReviewBusy = true; scReviewStop = false; scReviewRender(); scNotice('Очередь выполняется…');
@@ -100,19 +118,31 @@ async function scReviewQueue(action) {
       if (scReviewStop || scReviewClosed) break;
       const job = entry.jobs[i];
       if (action === 'sc-submit' ? job.check?.id || job.rejected : !job.check?.id) continue;
-      requests.push(scReviewMessage({ action, bidId: entry.bidId, job: i }));
+      if (automatic && (job.error || (action === 'sc-submit' ? job.attempted : !['pending', 'running'].includes(job.check?.status)))) continue;
+      requests.push(scReviewMessage({ action, bidId: entry.bidId, job: i, manual: !automatic }));
     }
     const outcomes = await Promise.allSettled(requests);
     if (scReviewClosed) return;
     const failed = outcomes.filter(result => result.status === 'rejected');
     if (failed.length) throw new Error(`${failed.length} из ${outcomes.length}: ${failed[0].reason.message}`);
-    scNotice(action === 'sc-submit' ? 'Отправка завершена. Нажмите «Обновить результаты» для получения текущих статусов.' : 'Результаты обновлены.');
+    scNotice(action === 'sc-submit' ? (scReviewPack.auto ? 'Отправка завершена. Результаты обновляются автоматически.' :
+      'Отправка завершена. Нажмите «Обновить результаты» для получения текущих статусов.') : 'Результаты обновлены.');
   } catch (e) { scNotice(`Очередь приостановлена: ${e.message}`); }
   finally { scReviewBusy = false; if (!scReviewClosed) await scReviewLoad().catch(e => scNotice(e.message)); }
 }
 document.getElementById('check').onclick = () => scReviewQueue('sc-submit');
 document.getElementById('refresh').onclick = () => scReviewQueue('sc-refresh');
-document.getElementById('stop').onclick = () => { scReviewStop = true; scReviewPort?.disconnect(); scNotice('Очередь остановится после текущего запроса.'); };
+document.getElementById('stop').onclick = () => {
+  scReviewStop = true; scReviewPort?.disconnect();
+  if (scReviewPack?.auto) scReviewMessage({ action: 'ai-cancel' }).catch(e => scNotice(e.message));
+  scNotice('Новые запросы и извлечение остановлены. Уже принятые Social Check задания не отменяются.');
+};
+document.getElementById('retry-ai').onclick = async () => {
+  try {
+    await scReviewMessage({ action: 'sc-auto-retry' });
+    scReviewStop = false; scReviewConnect(); scNotice('Повторное извлечение запущено в исходной вкладке.');
+  } catch (e) { scNotice(e.message); }
+};
 document.getElementById('sync').onclick = async () => {
   try { await scReviewMessage({ action: 'sc-sync' }); await scReviewLoad(); scNotice('Статусы сверены'); }
   catch (e) { scNotice(e.message); }
@@ -139,12 +169,19 @@ async function scReviewInit() {
     const a = scNode('a', `${new Date(pack.created).toLocaleString('ru')} (${pack.count})`, nav); a.href = 'review.html?id=' + encodeURIComponent(pack.id);
   }
   if (!result.packages.length) scNotice('Сохранённых пакетов нет. Начните подготовку в списке заявок.');
-  if (scReviewId) { scReviewConnect(); await scReviewLoad(); }
+  if (scReviewId) { scReviewConnect(); await scReviewLoad(); await scReviewAutomatic(); }
 }
 scReviewInit().catch(e => scNotice(e.message));
 // Source-page changes and another review tab are reflected without making API calls.
+async function scReviewAutomatic() {
+  if (!scReviewPack?.auto || scReviewPack.aiPaused || !scReviewSameStore || scReviewBusy || scReviewStop || scReviewClosed) return;
+  const fresh = scReviewPack.entries.some(e => e.jobs.some(j => !j.attempted && !j.check?.id && !j.rejected));
+  const pending = scReviewPack.entries.some(e => e.jobs.some(j => !j.error && j.check?.id && ['pending', 'running'].includes(j.check.status)));
+  if (fresh || pending) await scReviewQueue(fresh ? 'sc-submit' : 'sc-refresh', true);
+}
 setInterval(async () => {
-  if (!scReviewPack || scReviewBusy || document.hidden || document.querySelector('.pm-modal-backdrop')) return;
+  if (!scReviewPack || scReviewBusy || scReviewClosed || (document.hidden && !scReviewPack.auto) || document.querySelector('.pm-modal-backdrop')) return;
   try { await scReviewMessage({ action: 'sc-sync' }); await scReviewLoad(); }
   catch (_) { /* A lost source tab does not discard already received results. */ }
-}, 5000);
+  await scReviewAutomatic();
+}, 2000);

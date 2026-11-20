@@ -233,7 +233,7 @@ function content(count = 1) {
   const w = dom.window, messages = [], requests = [];
   w.AbortSignal = AbortSignal;
   w.chrome = { runtime: { id: 'synthetic', onMessage: { addListener: fn => { w.sourceListener = fn; } }, sendMessage: async msg => {
-    messages.push(msg); return { ok: true, mapping: { Instagram: 'instagram' }, interval: 800, catalog, id: 'synthetic-package' };
+    messages.push(msg); return { ok: true, mapping: { Instagram: 'instagram' }, interval: 800, catalog, aiConcurrency: 10, id: 'synthetic-package' };
   } }, storage: { local: { get: (_, cb) => cb({ urlPatterns: ['/bids'] }) }, onChanged: { addListener() {} } } };
   w.fetch = async (url, options) => {
     requests.push({ url, body: new URLSearchParams(options.body.toString()) });
@@ -250,161 +250,83 @@ function content(count = 1) {
   return { dom, w, requests, messages, root, button };
 }
 const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
-test('wizard: only single supported filter, first 10 visible fixed, list request not clicks, skip no replacement', async () => {
-  const s = content(12);
+test('automation: first ten visible bids use their full DOM accounts without list fetch or column chooser', async () => {
+  const s = content(12), pending = [];
   try {
     await settle(); assert.equal(s.w.document.querySelector('.pm-filter-social-btn'), null);
+    for (let id = 42; id < 54; id++) {
+      const tr = s.w.document.getElementById('status_id' + id).closest('tr');
+      tr.querySelector('td').insertAdjacentHTML('beforeend', `<div class="bids-item-title">Synthetic title ${id}</div>
+        <div class="section-accounts-js-${id}"><span data-account-full="test_${id}:SYNTHETIC_SECRET">short…</span></div>`);
+    }
+    const send = s.w.chrome.runtime.sendMessage;
+    s.w.chrome.runtime.sendMessage = msg => {
+      if (msg.action === 'ai-extract') { s.messages.push(msg); return new Promise(resolve => pending.push({ msg, resolve })); }
+      return send(msg);
+    };
     s.w.eval("pmActiveFilters.add('Instagram'); pmApplyFilter(); pmRenderFilterPanel();");
     s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    assert.equal(s.requests[0].body.toString(), 'do=list&bid_id=42&order_id=0&mode=0');
-    assert.match(s.root().textContent, /1 из 10/);
-    s.button('Пропустить').click(); await settle();
-    assert.equal(s.requests[1].body.get('bid_id'), '43');
-    s.button('Назад').click(); await settle();
-    assert.equal(s.requests.length, 10); // Background preload, not a second-page request.
-    s.button('Отмена').click(); assert.equal(s.root(), undefined);
-    assert.equal(s.messages.some(m => m.action === 'sc-create'), false);
+    assert.equal(s.requests.length, 0);
+    assert.equal(pending.length, 10);
+    assert.deepEqual(pending.map(p => p.msg.bidId), ['42','43','44','45','46','47','48','49','50','51']);
+    assert.ok(pending.every(p => p.msg.rows[0] === `test_${p.msg.bidId}:SYNTHETIC_SECRET`));
+    const create = s.messages.find(m => m.action === 'sc-auto-create');
+    assert.doesNotMatch(JSON.stringify(create), /SYNTHETIC_SECRET/);
+    assert.equal(s.root().querySelector('[data-column]'), null);
+    for (const p of pending.reverse()) p.resolve({ ok: true, count: 1 });
+    await settle(); assert.equal(s.root(), undefined);
+    assert.equal(s.w.eval('pmBusy'), null);
   } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
 });
-test('wizard starts products one second apart without waiting for responses, binds reverse responses and cancels queued starts', async () => {
-  const s = content(3), timers = [];
-  try {
-    await settle();
-    let now = 10000, resolveFirst;
-    s.w.Date.now = () => now;
-    s.w.setTimeout = (fn, ms) => { if (ms === 150) queueMicrotask(fn); else timers.push({ fn, ms }); return 1; };
-    s.w.fetch = async (url, options) => {
-      s.requests.push({ body: new URLSearchParams(options.body.toString()) });
-      if (s.requests.length === 1) await new Promise(resolve => { resolveFirst = resolve; });
-      return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_' + options.body.get('bid_id') + ':SYNTHETIC_PASSWORD' }] }) };
-    };
-    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
-    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    assert.equal(timers.length, 1); timers.shift().fn(); await settle();
-    assert.equal(s.requests.length, 1);
-    assert.ok(timers[0], 'The second start must be scheduled while the first response is pending');
-    assert.equal(timers[0].ms, 1000);
-    now += 1000; timers.shift().fn(); await settle();
-    assert.deepEqual(s.requests.map(r => r.body.get('bid_id')), ['42', '43']);
-    assert.match(s.root().textContent, /1 из 3/, 'Preload must not navigate the form');
-    resolveFirst(); await settle();
-    assert.match(s.root().textContent, /test_42/);
-    assert.doesNotMatch(s.root().textContent, /test_43/);
-    s.button('Пропустить').click(); await settle();
-    assert.match(s.root().textContent, /test_43/);
-    assert.equal(timers[0].ms, 1000);
-    s.button('Отмена').click(); now += 1000; timers.shift().fn(); await settle();
-    assert.equal(s.requests.length, 2, 'Cancellation must prevent the third request');
-    assert.equal(s.root(), undefined);
-  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
-});
-test('product timeout retries only the failed bid and succeeds within three attempts', async () => {
+test('automation: scoped format and description, missing format still passes title and row', async () => {
   const s = content(2);
   try {
-    await settle(); let attempts = 0;
-    s.w.fetch = async (url, options) => {
-      const body = new URLSearchParams(options.body.toString()); s.requests.push({ body });
-      if (body.get('bid_id') === '42' && ++attempts < 3) throw new s.w.DOMException('Synthetic timeout', 'TimeoutError');
-      return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_' + body.get('bid_id') + ':SYNTHETIC_PASSWORD' }] }) };
+    await settle();
+    const first = s.w.document.getElementById('status_id42').closest('tr');
+    first.querySelector('td').insertAdjacentHTML('beforeend', '<div class="bids-item-title">Synthetic A</div><span data-text-item="42">Synthetic description A</span><div class="section-accounts-js-42"><span data-account-full="user_a:TEST_PASSWORD">short</span></div>');
+    first.nextElementSibling.querySelector('td').insertAdjacentHTML('beforeend', '<div class="bid-macro-display-row"><span>Формат: </span><div class="section-bids-item"><div class="field-view">login:password</div></div></div>');
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    const entries = s.messages.find(m => m.action === 'sc-auto-create').entries;
+    assert.equal(entries[0].title, 'Synthetic A');
+    assert.equal(entries[0].description, 'Synthetic description A');
+    assert.equal(entries[0].format, 'login:password');
+    assert.equal(entries[1].format, '');
+    assert.equal(s.requests.length, 0);
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+test('automation: cancellation tells worker to stop and ignores late replies', async () => {
+  const s = content();
+  try {
+    await settle(); let release;
+    const send = s.w.chrome.runtime.sendMessage;
+    s.w.chrome.runtime.sendMessage = msg => msg.action === 'ai-extract'
+      ? new Promise(resolve => { release = resolve; }) : send(msg);
+    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
+    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
+    s.button('Отмена').click();
+    assert.ok(s.messages.some(m => m.action === 'ai-cancel'));
+    release({ ok: true, count: 1 }); await settle();
+    assert.equal(s.root(), undefined);
+    assert.equal(s.requests.length, 0);
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+test('automation: bounded content queue does not read or send later bids after cancellation', async () => {
+  const s = content(4), pending = [];
+  try {
+    await settle(); const send = s.w.chrome.runtime.sendMessage;
+    s.w.chrome.runtime.sendMessage = async msg => {
+      if (msg.action === 'ai-extract') { s.messages.push(msg); return new Promise(resolve => pending.push(resolve)); }
+      const result = await send(msg);
+      return msg.action === 'sc-public' ? { ...result, aiConcurrency: 2 } : result;
     };
     s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
     s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    assert.deepEqual(s.requests.map(r => r.body.get('bid_id')), ['42', '43', '42', '42']);
-    assert.match(s.root().textContent, /test_42/);
-    assert.ok(s.root().querySelector('[data-column]'));
-    s.button('Пропустить').click(); await settle();
-    assert.match(s.root().textContent, /test_43/);
-    assert.equal(s.messages.some(m => m.action === 'sc-create'), false);
+    assert.equal(pending.length, 2);
     s.button('Отмена').click();
-  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
-});
-test('product timeouts stop after three attempts and allow a fresh manual attempt', async () => {
-  const s = content();
-  try {
-    await settle(); let attempts = 0;
-    s.w.fetch = async () => { attempts++; throw new s.w.DOMException('Synthetic timeout', 'TimeoutError'); };
-    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
-    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    assert.equal(attempts, 3);
-    assert.equal(s.button('Повторить загрузку').disabled, false);
-    s.w.fetch = async () => { attempts++; return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] }) }; };
-    s.button('Повторить загрузку').click(); await settle();
-    assert.equal(attempts, 4);
-    assert.ok(s.root().querySelector('[data-column]'));
-    s.button('Отмена').click();
-  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
-});
-test('product timeout while reading the response body is retried', async () => {
-  const s = content();
-  try {
-    await settle(); let attempts = 0;
-    s.w.fetch = async () => ({ ok: true, json: async () => {
-      if (++attempts === 1) throw new s.w.DOMException('Synthetic timeout', 'TimeoutError');
-      return { code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] };
-    } });
-    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
-    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    assert.equal(attempts, 2);
-    assert.ok(s.root().querySelector('[data-column]'));
-    s.button('Отмена').click();
-  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
-});
-test('body AbortError caused by the timeout signal is retried with a fresh signal', async () => {
-  const s = content(), controllers = [];
-  try {
-    await settle(); let attempts = 0;
-    s.w.AbortSignal = { timeout: () => { const controller = new AbortController(); controllers.push(controller); return controller.signal; } };
-    s.w.fetch = async (url, options) => ({ ok: true, json: async () => {
-      if (++attempts === 1) {
-        controllers[0].abort(new DOMException('Synthetic timeout', 'TimeoutError'));
-        throw new DOMException('Body aborted', 'AbortError');
-      }
-      assert.equal(options.signal.aborted, false, 'An expired timeout signal cannot be reused');
-      return { code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] };
-    } });
-    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
-    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    assert.equal(attempts, 2);
-    assert.ok(s.root().querySelector('[data-column]'));
-    s.button('Отмена').click();
-  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
-});
-for (const stop of ['cancel', 'status']) test(`product retry uses the start interval and rechecks ${stop} before sending`, async () => {
-  const s = content(), timers = [];
-  try {
-    await settle(); let now = 10000, attempts = 0;
-    s.w.Date.now = () => now;
-    s.w.setTimeout = (fn, ms) => { if (ms === 150) queueMicrotask(fn); else timers.push({ fn, ms }); return 1; };
-    s.w.fetch = async () => { attempts++; throw new s.w.DOMException('Synthetic timeout', 'TimeoutError'); };
-    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
-    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    timers.shift().fn(); await settle();
-    assert.equal(attempts, 1);
-    assert.equal(timers[0]?.ms, 1000, 'Retry must use the same start queue, not bypass its interval');
-    if (stop === 'cancel') s.button('Отмена').click();
-    else s.w.document.getElementById('status_id42').value = '4';
-    now += 1000; timers.shift().fn(); await settle();
-    assert.equal(attempts, 1);
-    if (stop === 'cancel') assert.equal(s.root(), undefined);
-    else { assert.match(s.root().textContent, /Строка или статус изменились/); s.button('Отмена').click(); }
-  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
-});
-for (const failure of ['network', 'abort', 'http', 'json', 'list']) test(`product ${failure} errors are not automatically retried`, async () => {
-  const s = content();
-  try {
-    await settle(); let attempts = 0;
-    s.w.fetch = async () => {
-      attempts++;
-      if (failure === 'network') throw new TypeError('Synthetic network error');
-      if (failure === 'abort') throw new s.w.DOMException('Synthetic abort', 'AbortError');
-      if (failure === 'http') return { ok: false, status: 504 };
-      return { ok: true, json: async () => { if (failure === 'json') throw new SyntaxError('Synthetic malformed JSON'); return { code: 5 }; } };
-    };
-    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
-    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    assert.equal(attempts, 1);
-    assert.equal(s.button('Повторить загрузку').disabled, false);
-    s.button('Отмена').click();
+    for (const resolve of pending) resolve({ ok: true, count: 1 });
+    await settle();
+    assert.equal(s.messages.filter(m => m.action === 'ai-extract').length, 2);
   } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
 });
 test('manual status timeout is never automatically retried', async () => {
@@ -415,55 +337,6 @@ test('manual status timeout is never automatically retried', async () => {
     await assert.rejects(s.w.eval("pmSocialChange({bidId:'42',status:'2'}, '3')"), { name: 'TimeoutError' });
     assert.equal(attempts, 1);
     assert.equal(s.w.document.getElementById('status_id42').value, '2');
-  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
-});
-test('background completion preserves the current column choice and continues after another bid fails', async () => {
-  const s = content(3);
-  try {
-    await settle(); let releaseSecond;
-    s.w.fetch = async (url, options) => {
-      const body = new URLSearchParams(options.body.toString()); s.requests.push({ body });
-      if (body.get('bid_id') === '43') {
-        await new Promise(resolve => { releaseSecond = resolve; });
-        return { ok: true, json: async () => ({ code: 5 }) };
-      }
-      return { ok: true, json: async () => ({ code: 0, list: [{ data: 'test_a:SYNTHETIC_PASSWORD' }] }) };
-    };
-    s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
-    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    const column = s.root().querySelector('[data-column]');
-    column.value = '1'; column.dispatchEvent(new s.w.Event('change'));
-    releaseSecond(); await settle();
-    assert.deepEqual(s.requests.map(r => r.body.get('bid_id')), ['42', '43', '44']);
-    assert.equal(s.root().querySelector('[data-column]'), column, 'Background response must not redraw the active form');
-    assert.equal(column.value, '1');
-    assert.match(s.root().textContent, /1 из 3/);
-    s.button('Пропустить').click(); await settle();
-    assert.match(s.root().textContent, /2 из 3/);
-    assert.ok(s.button('Повторить загрузку'));
-    s.button('Пропустить').click(); await settle();
-    assert.match(s.root().textContent, /3 из 3/);
-    assert.ok(s.root().querySelector('[data-column]'));
-    s.button('Отмена').click();
-  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
-});
-test('wizard: reject before column choice, cancel restores step, server error retains synthetic reason', async () => {
-  const s = content();
-  try {
-    await settle(); s.w.eval("pmActiveFilters.add('Instagram'); pmRenderFilterPanel();");
-    s.w.document.querySelector('.pm-filter-social-btn').click(); await settle();
-    s.button('Отклонить заявку').click(); s.root().querySelector('.pm-modal-cancel').click(); await settle();
-    assert.match(s.root().textContent, /Заявка #42/);
-    s.button('Отклонить заявку').click(); s.root().querySelector('.pm-modal-reason').value = 'SYNTHETIC_REASON';
-    s.w.fetch = async () => ({ ok: true, json: async () => ({ code: 5 }) });
-    s.root().querySelector('.pm-modal-submit').click(); await settle();
-    assert.equal(s.root().querySelector('.pm-modal-reason').value, 'SYNTHETIC_REASON');
-    assert.equal(s.w.document.getElementById('status_id42').value, '2');
-    s.w.fetch = async () => ({ ok: true, json: async () => ({ code: 0 }) });
-    s.root().querySelector('.pm-modal-submit').click(); await settle();
-    assert.equal(s.w.document.getElementById('status_id42').value, '4');
-    assert.equal(s.root(), undefined);
-    assert.equal(s.messages.some(m => m.action === 'sc-create'), false);
   } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
 });
 test('source decisions: strict success, status rechecked after delay, native change not dispatched', async () => {

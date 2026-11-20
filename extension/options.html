@@ -21,6 +21,7 @@
     .section { border: 1px solid #e8e8e8; border-radius: 6px; padding: 14px 16px; margin-bottom: 20px; }
     .section-title { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
     input[type=text], input[type=password], input[type=number] { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+    select { max-width: 100%; padding: 7px 9px; border: 1px solid #ccc; border-radius: 4px; }
     button.secondary { padding: 7px 16px; background: #f5f5f5; color: #333; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; font-size: 13px; }
     button.secondary:hover { background: #e8e8e8; }
     #update-result { font-size: 13px; margin-top: 10px; min-height: 18px; }
@@ -29,6 +30,35 @@
 </head>
 <body>
   <h2>Position Matcher — Настройки</h2>
+
+  <div class="section">
+    <div class="section-title">ИИ — определение логинов</div>
+    <label for="ai-provider">Провайдер</label>
+    <select id="ai-provider">
+      <option value="openai">OpenAI (ChatGPT)</option>
+      <option value="deepseek">DeepSeek</option>
+      <option value="custom">Свой OpenAI-совместимый сервер</option>
+    </select>
+    <label for="ai-url">Базовый адрес API</label>
+    <input type="text" id="ai-url" placeholder="https://api.openai.com/v1/">
+    <div class="hint">Базовый адрес без /chat/completions. Только HTTPS; HTTP разрешён для localhost.</div>
+    <label for="ai-model">Модель</label>
+    <input type="text" id="ai-model" list="ai-models" autocomplete="off">
+    <datalist id="ai-models"></datalist>
+    <div class="hint">Выберите из списка сервера или введите ID модели вручную.</div>
+    <label for="ai-key">API-ключ ИИ</label>
+    <input type="password" id="ai-key" autocomplete="off">
+    <div id="ai-key-state" class="hint"></div>
+    <label><input type="checkbox" id="ai-clear-key"> Удалить сохранённый ключ ИИ</label>
+    <label for="ai-concurrency">Одновременных запросов к ИИ</label>
+    <input type="number" id="ai-concurrency" min="1" max="10" value="3">
+    <p class="hint">«Подготовить проверку» передаёт выбранному серверу ИИ до двух полных строк аккаунтов каждой поставки, название и формат. Строки могут содержать пароли, cookies и токены. Они не сохраняются в пакетах или журналах расширения. Сохраняя ключ, вы разрешаете такую передачу. Подписка ChatGPT не заменяет API-ключ. Запросы ИИ и Social Check могут оплачиваться отдельно.</p>
+    <div class="row">
+      <button class="secondary" id="ai-save" disabled>Сохранить ИИ</button>
+      <button class="secondary" id="ai-test" disabled>Проверить связь / загрузить модели</button>
+    </div>
+    <p id="ai-status" role="status"></p>
+  </div>
 
   <div class="section">
     <div class="section-title">Social Check</div>
@@ -94,5 +124,6 @@
   <script src="rejection-reasons.js"></script>
   <script src="options.js"></script>
   <script src="social-options.js"></script>
+  <script src="ai-options.js"></script>
 </body>
 </html>
