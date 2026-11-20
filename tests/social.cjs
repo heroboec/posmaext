@@ -250,10 +250,46 @@ function content(count = 1) {
   return { dom, w, requests, messages, root, button };
 }
 const settle = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
+test('launch button: Instagram remains visible and explains a missing catalog or mapping', async () => {
+  const s = content();
+  try {
+    await settle();
+    s.w.eval("pmActiveFilters.add('Instagram'); pmSocialConfig.catalog = []; pmRenderFilterPanel();");
+    let btn = s.w.document.querySelector('.pm-filter-social-btn');
+    assert.ok(btn);
+    assert.equal(btn.disabled, true);
+    assert.match(s.w.document.querySelector('.pm-social-hint').textContent, /Проверить связь/);
+    s.w.eval("pmSocialConfig.catalog = " + JSON.stringify(catalog) + "; pmRenderFilterPanel();");
+    assert.equal(s.w.document.querySelector('.pm-filter-social-btn').disabled, false);
+    s.w.eval("pmSocialConfig.mapping = {}; pmRenderFilterPanel();");
+    btn = s.w.document.querySelector('.pm-filter-social-btn');
+    assert.ok(btn);
+    assert.equal(btn.disabled, true);
+    assert.match(s.w.document.querySelector('.pm-social-hint').textContent, /Instagram/);
+    assert.match(s.w.document.querySelector('.pm-social-hint').textContent, /сопоставление/i);
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
+test('launch button: background connection errors are visible and focus retry recovers', async () => {
+  const s = content();
+  try {
+    await settle();
+    s.w.eval("pmActiveFilters.add('Instagram')");
+    const send = s.w.chrome.runtime.sendMessage;
+    s.w.chrome.runtime.sendMessage = async msg => msg.action === 'sc-public'
+      ? { ok: false, error: 'SYNTHETIC_CONNECTION_FAILURE' } : send(msg);
+    s.w.dispatchEvent(new s.w.Event('focus')); await settle();
+    assert.ok(s.w.document.querySelector('.pm-filter-social-btn'));
+    assert.equal(s.w.document.querySelector('.pm-filter-social-btn').disabled, true);
+    assert.match(s.w.document.querySelector('.pm-social-hint').textContent, /SYNTHETIC_CONNECTION_FAILURE/);
+    s.w.chrome.runtime.sendMessage = send;
+    s.w.dispatchEvent(new s.w.Event('focus')); await settle();
+    assert.equal(s.w.document.querySelector('.pm-filter-social-btn').disabled, false);
+  } finally { s.w.eval('pmObserver?.disconnect()'); await settle(); s.dom.window.close(); }
+});
 test('automation: first ten visible bids use their full DOM accounts without list fetch or column chooser', async () => {
   const s = content(12), pending = [];
   try {
-    await settle(); assert.equal(s.w.document.querySelector('.pm-filter-social-btn'), null);
+    await settle(); assert.equal(s.w.document.querySelector('.pm-filter-social-btn').disabled, true);
     for (let id = 42; id < 54; id++) {
       const tr = s.w.document.getElementById('status_id' + id).closest('tr');
       tr.querySelector('td').insertAdjacentHTML('beforeend', `<div class="bids-item-title">Synthetic title ${id}</div>

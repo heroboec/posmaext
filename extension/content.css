@@ -45,6 +45,8 @@ tr.pm-hidden-by-filter { display: none !important; }
 .pm-filter-sep { height: 1px; background: #ddd; margin: 2px 0; align-self: stretch; }
 .pm-filter-open-btn { font-weight: 600; }
 .pm-filter-open-btn:disabled { opacity: .6; cursor: default; }
+.pm-filter-social-btn:disabled { opacity: .65; cursor: default; }
+.pm-social-hint { max-width: 270px; white-space: normal; overflow-wrap: anywhere; color: #805600; font-size: 12px; line-height: 1.4; padding: 4px; }
 
 .pm-float-save {
   position: fixed;

@@ -1,6 +1,7 @@
 'use strict';
 
 let pmSocialConfig = null;
+let pmSocialConfigError = '';
 let pmSocialPreparing = false;
 const pmSocialPackages = new Map();
 let pmSocialLastResponse = 0;
@@ -11,20 +12,32 @@ async function pmSocialMessage(message) {
   if (!result?.ok) throw new Error(result?.error || 'Нет связи с расширением');
   return result;
 }
-function pmSocialPlatform() {
-  if (pmActiveFilters.size !== 1 || !pmSocialConfig) return null;
-  const platform = pmSocialConfig.mapping[[...pmActiveFilters][0]];
-  return platform && PM_SOCIAL.types(pmSocialConfig.catalog, platform).length ? platform : null;
+function pmSocialAvailability() {
+  if (pmSocialConfigError) return { reason: `Нет связи с расширением: ${pmSocialConfigError}. Перезагрузите расширение и страницу.` };
+  if (!pmSocialConfig) return { reason: 'Загружаю настройки проверки…' };
+  if (pmActiveFilters.size !== 1) return { reason: 'Выберите ровно одну категорию в фильтре.' };
+  const category = [...pmActiveFilters][0];
+  const platform = pmSocialConfig.mapping?.[category];
+  if (!platform) return { reason: `Social Check: настройте сопоставление категории «${category}» с платформой в настройках расширения.` };
+  if (!pmSocialConfig.catalog?.length) return { reason: 'Social Check: каталог платформ не загружен. В настройках нажмите «Проверить связь».' };
+  if (!PM_SOCIAL.types(pmSocialConfig.catalog, platform).length) return { reason: `Social Check: платформа «${platform}» недоступна для проверки профилей. В настройках нажмите «Проверить связь» и проверьте каталог сервиса.` };
+  return { platform, reason: '' };
 }
+function pmSocialPlatform() { return pmSocialAvailability().platform || null; }
 function pmSocialButton(panel) {
-  if (!pmSocialPlatform()) return;
+  const available = pmSocialAvailability();
   const button = document.createElement('button');
   button.className = 'pm-filter-btn pm-filter-social-btn';
   button.textContent = 'Подготовить проверку';
-  button.title = 'Первые 10 видимых поставок: аккаунты из разметки → ИИ → Social Check';
-  button.disabled = !!pmBusy || pmSocialPreparing;
+  button.title = available.reason || 'Первые 10 видимых поставок: аккаунты из разметки → ИИ → Social Check';
+  button.disabled = !!pmBusy || pmSocialPreparing || !available.platform;
   button.onclick = pmSocialPrepare;
   panel.append(button);
+  if (available.reason) {
+    const hint = document.createElement('div');
+    hint.className = 'pm-social-hint'; hint.textContent = available.reason;
+    hint.setAttribute('role', 'status'); panel.append(hint);
+  }
 }
 function pmSocialCurrent(bidId) { return pmSelectableRows().find(b => b.bidId === bidId); }
 function pmSocialMetadata(item, platform) {
@@ -109,8 +122,9 @@ async function pmSocialPrepare() {
   pmBusy = { kind: 'social-preparing', progress: '' }; pmRenderFilterPanel(); pmSyncSelection();
   try {
     pmSocialConfig = await pmSocialMessage({ action: 'sc-public' });
+    pmSocialConfigError = '';
     const platform = pmSocialPlatform();
-    if (!platform) throw new Error('Выберите одну поддерживаемую категорию. Проверьте связь с API в настройках');
+    if (!platform) throw new Error(pmSocialAvailability().reason);
     const items = pmSelectableRows().filter(b => !b.row.hidden && !b.row.classList.contains('pm-hidden-by-filter') && getComputedStyle(b.row).display !== 'none')
       .slice(0, 10).map(b => pmSocialMetadata(b, platform));
     if (!items.length) return;
@@ -221,10 +235,11 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   })().then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
   return true;
 });
-if (pmListEnabled()) pmSocialMessage({ action: 'sc-public' }).then(config => {
-  pmSocialConfig = config; if (pmUrlMatches()) pmRenderFilterPanel();
-}).catch(() => {});
-window.addEventListener('focus', () => {
+async function pmSocialLoadConfig() {
   if (!pmListEnabled()) return;
-  pmSocialMessage({ action: 'sc-public' }).then(config => { pmSocialConfig = config; if (pmUrlMatches()) pmRenderFilterPanel(); }).catch(() => {});
-});
+  try { pmSocialConfig = await pmSocialMessage({ action: 'sc-public' }); pmSocialConfigError = ''; }
+  catch (e) { pmSocialConfigError = e.message; }
+  if (pmUrlMatches()) pmRenderFilterPanel();
+}
+pmSocialLoadConfig();
+window.addEventListener('focus', pmSocialLoadConfig);
