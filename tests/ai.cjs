@@ -78,6 +78,21 @@ test('diagnostics: failed AI HTTP body and evaluated row are available only to t
   assert.doesNotMatch(JSON.stringify(await w.ctx.db.get('package:' + run.id)), /SYNTHETIC_PASSWORD|SYNTHETIC_GATEWAY_RESPONSE/);
   assert.equal(w.requests.length, before);
 });
+test('diagnostics: the exact system prompt sent to the model is available for inspection', async () => {
+  const w = setup(); await w.configure(); const run = await w.create();
+  assert.equal((await w.extract(run)).ok, true);
+  const sent = JSON.parse(w.requests[0].init.body).messages.find(m => m.role === 'system').content;
+  assert.match(sent, /supplier format is only a fallible hint/);
+  assert.match(sent, /Field order is another weak clue/);
+  assert.match(sent, /Contradictory data overrides this ordering hint/);
+  assert.match(sent, /Analyze each row independently/);
+  assert.match(sent, /Do not split blindly on every colon/);
+  assert.match(sent, /merged label is not a reason to shift columns/);
+  assert.match(sent, /two ambiguous secret-like tokens are not sufficient evidence/);
+  const result = await w.send({ action: 'sc-diagnostics', id: run.id, bidId: '42' }, { url: 'chrome-extension://test/review.html' });
+  assert.equal(result.diagnostics.ai[0].request.systemPrompt, sent);
+  assert.doesNotMatch(JSON.stringify(result), /AI_TEST_KEY|SOCIAL_TEST_KEY/);
+});
 
 test('AI: uses full row with title and fallback format; persists only verified logins', async () => {
   const w = setup(); await w.configure(); const run = await w.create();
