@@ -81,13 +81,9 @@ function scReviewRender() {
       scNode('td', 'Не определён', tr);
       const cell = scNode('td', issue, tr); cell.colSpan = fields.length + 2; cell.className = 'error';
     }
-    scNode('h3', 'Исходные свойства поставщика', article);
-    if (!entry.properties.length) scNode('p', 'В доступной разметке свойства не найдены', article);
-    else {
-      const props = scNode('table', undefined, article);
-      entry.properties.forEach(p => { const tr = scNode('tr', undefined, props); scNode('th', p.label, tr); scNode('td', p.value, tr); });
-    }
     const actions = scNode('div', undefined, article); actions.className = 'actions';
+    const diagnostics = scNode('button', 'Диагностика запросов', actions); diagnostics.className = 'pm-diagnostics-open';
+    diagnostics.onclick = () => scReviewDiagnostics(entry);
     const conflict = entry.sourceStatus !== undefined && entry.sourceStatus !== entry.status;
     const accept = scNode('button', 'Принять → В продаже', actions); accept.className = 'accept';
     accept.disabled = scReviewBusy || conflict || !['2', '6', '7'].includes(entry.status);

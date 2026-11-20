@@ -25,7 +25,7 @@ function setup() {
       }) };
     },
   });
-  for (const file of ['social-common.js', 'social-store.js', 'social-worker.js', 'ai-worker.js']) {
+  for (const file of ['social-common.js', 'social-store.js', 'diagnostics.js', 'social-worker.js', 'ai-worker.js']) {
     vm.runInContext(fs.readFileSync('extension/' + file, 'utf8'), ctx);
   }
   vm.runInContext('globalThis.db = PM_DB', ctx);
@@ -60,6 +60,23 @@ test('AI: credentials protected, custom endpoint binding and HTTPS validation', 
   assert.equal((await w.configure({ url: 'https://other.example.test/v1/', key: '' })).ok, true);
   assert.equal((await w.send({ action: 'ai-config-get' }, options)).hasKey, false);
   assert.equal((await w.configure({ url: 'http://remote.example.test/' })).ok, false);
+});
+test('diagnostics: failed AI HTTP body and evaluated row are available only to the review page', async () => {
+  const w = setup(); await w.configure(); const run = await w.create();
+  w.ctx.fetch = async () => ({ ok: false, status: 400, headers: new Headers(),
+    text: async () => 'SYNTHETIC_GATEWAY_RESPONSE AI_TEST_KEY' });
+  assert.equal((await w.extract(run)).ok, false);
+  const before = w.requests.length;
+  assert.equal((await w.send({ action: 'sc-diagnostics', id: run.id, bidId: '42' })).ok, false);
+  assert.equal((await w.send({ action: 'sc-diagnostics', id: run.id, bidId: '42' }, options)).ok, false);
+  const result = await w.send({ action: 'sc-diagnostics', id: run.id, bidId: '42' }, { url: 'chrome-extension://test/review.html' });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.diagnostics.rows[0].value, 'test_user:SYNTHETIC_PASSWORD');
+  assert.match(result.diagnostics.ai[0].body, /SYNTHETIC_GATEWAY_RESPONSE/);
+  assert.equal(result.diagnostics.ai[0].status, 400);
+  assert.doesNotMatch(JSON.stringify(result), /AI_TEST_KEY|SOCIAL_TEST_KEY/);
+  assert.doesNotMatch(JSON.stringify(await w.ctx.db.get('package:' + run.id)), /SYNTHETIC_PASSWORD|SYNTHETIC_GATEWAY_RESPONSE/);
+  assert.equal(w.requests.length, before);
 });
 
 test('AI: uses full row with title and fallback format; persists only verified logins', async () => {

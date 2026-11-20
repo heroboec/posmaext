@@ -76,7 +76,7 @@ function aiParse(json, rows, platform, types) {
   }
   return { jobs, issues, resolved, identities };
 }
-async function aiRequest(config, entry, rows, types, signal, preflight) {
+async function aiRequest(config, entry, rows, types, signal, preflight, diagnostic) {
   const resolved = new Set(), jobs = new Map();
   const collected = () => ({ jobs: [...jobs.values()], resolved: [...resolved],
     issues: rows.flatMap((_, i) => resolved.has(i) ? [] : [`Строка ${i + 1}: логин не определён`]) });
@@ -85,9 +85,15 @@ async function aiRequest(config, entry, rows, types, signal, preflight) {
     if (JSON.stringify(await aiConfig()) !== JSON.stringify(config)) throw new Error('Настройки ИИ изменились. Запустите подготовку заново');
     await aiPermission(config);
     await preflight();
-    let retry = 0, terminal = false;
+    let retry = 0, terminal = false, trace;
     try {
       const pending = rows.map((_, i) => i).filter(i => !resolved.has(i));
+      PM_DIAG.addSecrets([config.key]);
+      trace = PM_DIAG.start({ kind: 'ai', packId: diagnostic.packId, bidId: entry.bidId,
+        contextId: diagnostic.contextId, indexes: pending.map(i => diagnostic.indexes[i]),
+        attempt: attempt + 1, method: 'POST', endpoint: new URL('chat/completions', config.url).href,
+        request: { model: config.model, platform: entry.platform, title: entry.title, format: entry.format || null,
+          allowedTypes: types, rows: pending.map((i, index) => ({ index, sourceIndex: diagnostic.indexes[i] })) } });
       const response = await fetch(new URL('chat/completions', config.url).href, {
         method: 'POST', credentials: 'omit', redirect: 'error', cache: 'no-store',
         headers: { Authorization: 'Bearer ' + config.key, 'Content-Type': 'application/json' },
@@ -99,13 +105,15 @@ async function aiRequest(config, entry, rows, types, signal, preflight) {
           ] }),
         signal: AbortSignal.any([signal, AbortSignal.timeout(25000)]),
       });
+      const captured = await PM_DIAG.capture(response, trace);
+      signal.throwIfAborted();
       if (!response.ok) {
         terminal = ![408, 425, 429].includes(response.status) && response.status < 500;
         retry = aiRetryAfter(response);
         throw new Error(response.status === 401 || response.status === 403 ? 'ИИ: неверный ключ или доступ запрещён' :
           response.status === 404 ? 'ИИ: адрес или модель не найдены' : `ИИ: HTTP ${response.status}`);
       }
-      const result = aiParse(await response.json(), pending.map(i => rows[i]), entry.platform, types);
+      const result = aiParse(captured.json(), pending.map(i => rows[i]), entry.platform, types);
       for (const identity of result.identities) {
         const sourceIndex = pending[identity.index];
         if (resolved.has(sourceIndex)) continue;
@@ -113,11 +121,17 @@ async function aiRequest(config, entry, rows, types, signal, preflight) {
         const key = JSON.stringify([identity.type, identity.identifier]);
         if (!jobs.has(key)) jobs.set(key, result.jobs.find(j =>
           j.query.identifier_type === identity.type && j.query.identifier === identity.identifier));
+        PM_DIAG.link(diagnostic.packId, entry.bidId, diagnostic.contextId, diagnostic.indexes[sourceIndex],
+          { platform: entry.platform, identifier_type: identity.type, identifier: identity.identifier });
       }
-      if (resolved.size === rows.length || attempt === PM_SOCIAL.retryLimit) return collected();
+      if (resolved.size === rows.length) return collected();
+      if (attempt === PM_SOCIAL.retryLimit) {
+        PM_DIAG.error(trace, new Error('ИИ не определил все логины')); return collected();
+      }
       // A valid JSON answer with null logins is also a failed extraction, not success.
       throw new Error('ИИ не определил все логины');
     } catch (error) {
+      PM_DIAG.error(trace, error);
       signal.throwIfAborted();
       if (terminal || attempt === PM_SOCIAL.retryLimit) {
         if (jobs.size) return collected();
@@ -133,6 +147,7 @@ async function scAutoCreate(msg, sender) {
   if (!/^[a-f0-9-]{36}$/.test(msg.packageId) || !Array.isArray(msg.entries) || !msg.entries.length || msg.entries.length > 10) throw new Error('Неверный пакет');
   const ai = await aiConfig(); await aiPermission(ai);
   const c = await scConfig(), binding = await scBinding(c);
+  PM_DIAG.addSecrets([ai.key, c.key]);
   if (!c.key) throw new Error('Укажите ключ Social Check в настройках');
   let pack = await PM_DB.get('package:' + msg.packageId);
   const fresh = !pack;
@@ -182,6 +197,8 @@ async function aiExtract(msg, sender) {
       if (!Array.isArray(rows) || !rows.length || rows.some(r => typeof r !== 'string' || !r.trim() || r.length > 64000)) throw new Error('В разметке нет полных строк или превышен размер строки (64 000 символов)');
       const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(rows)));
       const digest = Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
+      const contextId = `${run.runId}:${entry.bidId}:${digest}`;
+      PM_DIAG.rows(pack.id, entry.bidId, contextId, rows);
       let extracted = [];
       await scExclusive(async () => {
         const latest = await scPackage(pack.id);
@@ -223,7 +240,8 @@ async function aiExtract(msg, sender) {
           let release;
           try {
             release = await aiSlot(config, signal);
-            const result = await aiRequest(config, entry, indexes.map(i => rows[i]), PM_SOCIAL.types(await PM_DB.get('catalog'), entry.platform), signal, preflight);
+            const result = await aiRequest(config, entry, indexes.map(i => rows[i]), PM_SOCIAL.types(await PM_DB.get('catalog'), entry.platform),
+              signal, preflight, { packId: pack.id, contextId, indexes });
             await preflight();
             await scExclusive(async () => {
               const latest = await scPackage(pack.id), target = latest.entries.find(e => e.bidId === entry.bidId);

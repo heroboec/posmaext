@@ -16,10 +16,11 @@ async function review(jobs, failSubmit = false, extra = {}) {
     messages.push(msg);
     if (msg.action === 'sc-list') return { ok: true, packages: [] };
     if (msg.action === 'sc-get') return { ok: true, package: structuredClone(pack), sameStore: true };
+    if (msg.action === 'sc-diagnostics') return { ok: true, diagnostics: extra.diagnostics || { available: false, rowChoices: [], rows: [], ai: [], social: [] } };
     if (msg.action === 'sc-submit' && failSubmit) return { ok: false, error: 'Synthetic pause' };
     return { ok: true };
   } }, storage: { local: { get: (_, cb) => cb({}) }, onChanged: { addListener() {} } } };
-  for (const name of ['rejection-reasons.js', 'social-common.js', 'content.js', 'review.js']) {
+  for (const name of ['rejection-reasons.js', 'social-common.js', 'content.js', 'review-diagnostics.js', 'review.js']) {
     const script = w.document.createElement('script'); script.textContent = file(name); w.document.head.append(script);
   }
   await settle(); return { w, dom, messages, pack, intervals };
@@ -63,7 +64,7 @@ test('review renders horizontal rows, 0 vs null and unavailable without claiming
     const cells = [...table.querySelector('tbody tr').children].map(n => n.textContent);
     assert.equal(cells[6], '0'); assert.equal(cells[3], 'Нет данных');
     assert.match(cells[1], /Недоступно \(не означает отсутствие\)/);
-    assert.match(s.w.document.querySelector('article').textContent, /Непроверяемое свойство/);
+    assert.doesNotMatch(s.w.document.querySelector('article').textContent, /Непроверяемое свойство|Исходные свойства поставщика/);
     assert.equal(s.w.document.querySelector('pre'), null);
     s.w.document.getElementById('check').click(); await settle();
     assert.equal(s.messages.filter(m => m.action === 'sc-submit').length, 0);
@@ -85,7 +86,7 @@ test('review dispatches the batch concurrently, reports errors and does not issu
     assert.equal(s.w.document.getElementById('check').disabled, false);
   } finally { s.dom.window.close(); }
 });
-test('each account occupies its own row; supplier claims remain in a separate block', async () => {
+test('each account occupies its own row; supplier properties table is removed', async () => {
   const first = job('found'), second = job('found');
   first.query.identifier = 'synthetic_first'; first.check.result.data.followers = 120;
   second.query.identifier = 'synthetic_second'; second.check.result.data.followers = 5;
@@ -96,8 +97,52 @@ test('each account occupies its own row; supplier claims remain in a separate bl
     assert.deepEqual(rows.map(tr => [tr.children[0].textContent, tr.children[6].textContent]),
       [['synthetic_first', '120'], ['synthetic_second', '5']]);
     const supplierRows = [...s.w.document.querySelectorAll('article > table tr')];
-    assert.deepEqual(supplierRows.map(tr => [...tr.children].map(cell => cell.textContent)),
-      [['Подписчики', '100'], ['Непроверяемое свойство', 'Synthetic']]);
+    assert.equal(supplierRows.length, 0);
     assert.equal(s.w.document.querySelectorAll('article > .scroll').length, 1);
+  } finally { s.dom.window.close(); }
+});
+test('diagnostics window is optional, renders source and responses as text and makes no paid requests', async () => {
+  const s = await review([job('failed')], false, { diagnostics: {
+    available: true, rowChoices: [{ id: 1, index: 0, time: 1000 }],
+    rows: [{ id: 1, index: 0, time: 1000, value: 'test_profile:SYNTHETIC_PASSWORD' }],
+    ai: [{ id: 2, attempt: 1, method: 'POST', endpoint: 'https://ai.example.test/v1/chat/completions',
+      time: 1000, ended: 1500, status: 502, error: 'Synthetic gateway failure', body: '<script>window.executed=true</script>' }],
+    social: [{ id: 3, attempt: 2, method: 'POST', endpoint: 'https://api.example.test/api/v1/checks',
+      time: 2000, status: 500, body: '{"error":"SYNTHETIC_SERVICE_ERROR"}' }],
+  } });
+  try {
+    assert.equal(s.w.document.querySelector('.pm-diagnostics-backdrop'), null);
+    assert.doesNotMatch(s.w.document.getElementById('entries').textContent, /SYNTHETIC_PASSWORD/);
+    s.w.document.querySelector('.pm-diagnostics-open').click(); await settle();
+    const root = s.w.document.querySelector('.pm-diagnostics-backdrop').shadowRoot;
+    assert.match(root.textContent, /test_profile:SYNTHETIC_PASSWORD/);
+    assert.match(root.textContent, /Synthetic gateway failure/);
+    assert.match(root.textContent, /SYNTHETIC_SERVICE_ERROR/);
+    assert.equal(root.querySelector('script'), null); assert.equal(s.w.executed, undefined);
+    root.querySelector('.pm-diagnostics-refresh').click(); await settle();
+    assert.equal(s.messages.filter(m => m.action === 'sc-diagnostics').length, 2);
+    assert.equal(s.messages.filter(m => ['sc-submit','sc-refresh','ai-extract'].includes(m.action)).length, 0);
+    root.querySelector('.pm-diagnostics-close').click();
+    assert.equal(s.w.document.querySelector('.pm-diagnostics-backdrop'), null);
+    s.w.document.querySelector('.pm-diagnostics-open').click(); await settle();
+    const again = s.w.document.querySelector('.pm-diagnostics-backdrop').shadowRoot;
+    again.querySelector('.pm-diagnostics-select').value = 'row:1';
+    again.querySelector('.pm-diagnostics-select').dispatchEvent(new s.w.Event('change')); await settle();
+    assert.equal(s.messages.at(-1).rowId, 1);
+    again.dispatchEvent(new s.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    assert.equal(s.w.document.querySelector('.pm-diagnostics-backdrop'), null);
+  } finally { s.dom.window.close(); }
+});
+test('an open diagnostics window survives result redraws and does not pause automatic checks', async () => {
+  const s = await review([job('found')], false, { auto: true, entry: { extractionState: 'pending' } });
+  try {
+    s.w.document.querySelector('.pm-diagnostics-open').click(); await settle();
+    const modal = s.w.document.querySelector('.pm-diagnostics-backdrop');
+    s.pack.auto = true;
+    s.pack.entries[0].jobs.push({ query: { ...job('found').query, identifier: 'new_profile' }, key: 'new-key' });
+    await s.intervals[0](); await settle();
+    assert.equal(s.w.document.querySelector('.pm-diagnostics-backdrop'), modal);
+    assert.equal(s.messages.filter(m => m.action === 'sc-submit').length, 1);
+    assert.equal(s.messages.some(m => m.action === 'ai-cancel'), false);
   } finally { s.dom.window.close(); }
 });

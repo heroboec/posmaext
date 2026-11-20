@@ -32,7 +32,7 @@ function worker(indexedDB = new IDBFactory()) {
         query: options.body ? JSON.parse(options.body) : { platform: 'instagram', identifier_type: 'username', identifier: 'test_profile_a' } }) };
     }, Headers,
   });
-  for (const name of ['social-common.js', 'social-store.js', 'social-worker.js']) vm.runInContext(source(name), context);
+  for (const name of ['social-common.js', 'social-store.js', 'diagnostics.js', 'social-worker.js']) vm.runInContext(source(name), context);
   vm.runInContext('globalThis.api = { scHandle, scBinding, scApi, db: PM_DB, common: PM_SOCIAL };', context);
   // Advance virtual time by the requested wait; no real API or paid calls occur.
   context.setTimeout = (fn, ms) => { clock += ms || 0; queueMicrotask(fn); };
@@ -85,6 +85,23 @@ test('worker protects key/settings and persists only compact selected values wit
   assert.equal(w.requests[0].options.credentials, 'omit');
   assert.equal((await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' })).ok, true);
   assert.equal(w.requests.length, 1);
+});
+test('Social Check diagnostics preserve the raw error body without exposing the API key or making extra calls', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(); let requests = 0;
+  w.context.fetch = async () => {
+    requests++;
+    return { ok: false, status: 400, headers: new Headers(),
+      text: async () => '{"error":"SYNTHETIC_REMOTE_DETAIL","key":"SYNTHETIC_API_KEY"}' };
+  };
+  assert.equal((await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' })).ok, false);
+  const result = await w.send({ action: 'sc-diagnostics', id, bidId: '42', job: 0 });
+  assert.equal(result.ok, true);
+  assert.equal(result.diagnostics.social.length, 1);
+  assert.equal(result.diagnostics.social[0].status, 400);
+  assert.match(result.diagnostics.social[0].body, /SYNTHETIC_REMOTE_DETAIL/);
+  assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_API_KEY/);
+  assert.equal(requests, 1);
+  assert.doesNotMatch(JSON.stringify((await w.send({ action: 'sc-get', id })).package), /SYNTHETIC_REMOTE_DETAIL/);
 });
 test('check retries: ten automatic retries, fixed two-second delay and identical idempotency key', async () => {
   const w = worker(); await w.setup(); const id = await w.create(), requests = [];

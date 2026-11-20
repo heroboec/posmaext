@@ -46,7 +46,7 @@ function scRecovered() {
   scLimitSerial = task.catch(() => {});
   return task;
 }
-async function scApi(path, { method = 'GET', query, key, owner, binding, preflight } = {}) {
+async function scApi(path, { method = 'GET', query, key, owner, binding, preflight, diagnostic } = {}) {
   // No normal request spacing. Only a server/network cooldown delays new starts.
   for (;;) {
     await scLimitSerial;
@@ -65,17 +65,25 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
   }
   await preflight?.();
   scAssertLive(owner);
-  let response;
+  let response, trace;
+  if (diagnostic) {
+    PM_DIAG.addSecrets([config.key]);
+    trace = PM_DIAG.start({ ...diagnostic, kind: 'social', method, endpoint: new URL('api/v1/' + path, config.url).href,
+      queryKey: PM_DIAG.queryKey(diagnostic.query) });
+    diagnostic.traceId = trace;
+  }
   try {
     response = await fetch(new URL('api/v1/' + path, config.url).href, {
       method, credentials: 'omit', redirect: 'error', cache: 'no-store',
       headers: { Authorization: 'Bearer ' + config.key, ...(query ? { 'Content-Type': 'application/json', 'Idempotency-Key': key } : {}) },
       ...(query ? { body: JSON.stringify(query) } : {}), signal: AbortSignal.timeout(30000),
     });
-  } catch (_) {
+  } catch (err) {
+    PM_DIAG.error(trace, err);
     await scBackoff();
     throw Object.assign(new Error('Сетевой сбой. Результат отправки неизвестен; повтор использует прежний ключ'), { retryable: true });
   }
+  const captured = diagnostic ? await PM_DIAG.capture(response, trace) : null;
   if ([408, 425, 429].includes(response.status) || response.status >= 500) {
     const header = response.headers.get('Retry-After');
     const retry = header && /^\d+(\.\d+)?$/.test(header) ? Number(header) * 1000 : Math.max(0, Date.parse(header) - Date.now()) || 0;
@@ -87,11 +95,13 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
     const error = new Error(messages[response.status] || `API: HTTP ${response.status}`);
     error.httpStatus = response.status;
     error.retryable = [408, 425, 429].includes(response.status) || response.status >= 500;
+    PM_DIAG.error(trace, error);
     throw error;
   }
   await scRecovered();
   let json;
-  try { json = await response.json(); } catch (_) {
+  try { json = captured ? captured.json() : await response.json(); } catch (err) {
+    PM_DIAG.error(trace, err);
     await scBackoff();
     throw Object.assign(new Error('API вернул некорректный JSON; повтор использует прежний ключ'), { retryable: true });
   }
@@ -203,7 +213,21 @@ async function scHandle(msg, sender) {
   }
   const pack = await scPackage(msg.id);
   if (msg.action === 'sc-get') return { package: pack, sameStore: pack.binding === await scBinding(await scConfig()) };
+  if (msg.action === 'sc-diagnostics') {
+    if (!scPage(sender, 'review.html')) throw new Error('Откройте страницу результатов');
+    const target = pack.entries.find(e => e.bidId === msg.bidId);
+    if (!target) throw new Error('Заявка не входит в пакет');
+    if (msg.rowId !== undefined && (!Number.isInteger(msg.rowId) || msg.rowId < 1 || msg.job !== undefined)) throw new Error('Некорректная строка');
+    let query;
+    if (msg.job !== undefined) {
+      if (!Number.isInteger(msg.job) || !target.jobs[msg.job]) throw new Error('Аккаунт не найден');
+      query = target.jobs[msg.job].query;
+    }
+    PM_DIAG.addSecrets([(await scConfig()).key, typeof aiConfig === 'function' ? (await aiConfig()).key : '']);
+    return { diagnostics: PM_DIAG.get(pack.id, target.bidId, query, msg.rowId) };
+  }
   if (msg.action === 'sc-delete') {
+    PM_DIAG.clear(pack.id);
     if (typeof aiRuns !== 'undefined') { aiRuns.get(pack.id)?.controller.abort(); aiRuns.delete(pack.id); }
     await PM_DB.delete('package:' + pack.id);
     await PM_DB.set('packages', (await PM_DB.get('packages') || []).filter(id => id !== pack.id));
@@ -267,8 +291,10 @@ async function scHandle(msg, sender) {
 async function scRunCheck(msg, pack, entry, job, owner) {
   let error;
   for (let attempt = 0; attempt <= PM_SOCIAL.retryLimit; attempt++) {
+    let diagnostic;
     try {
-      const request = { owner, binding: pack.binding, preflight: async () => {
+      diagnostic = { packId: pack.id, bidId: entry.bidId, query: job.query, attempt: attempt + 1 };
+      const request = { owner, binding: pack.binding, diagnostic, preflight: async () => {
         const latest = await scPackage(pack.id);
         if (latest.entries.find(e => e.bidId === entry.bidId)?.jobs[msg.job]?.key !== job.key) throw new Error('Проверка в пакете изменилась');
         if (latest.auto && msg.action === 'sc-submit') {
@@ -287,6 +313,7 @@ async function scRunCheck(msg, pack, entry, job, owner) {
           (job.check?.id && job.check.id !== check.id)) throw Object.assign(new Error('Некорректный ответ проверки; повтор использует прежний ключ'), { retryable: true });
       job.check = check; job.error = null; error = null; break;
     } catch (e) {
+      PM_DIAG.error(diagnostic?.traceId, e);
       job.error = e.message;
       if ([400, 409].includes(e.httpStatus)) job.rejected = true;
       error = e;
