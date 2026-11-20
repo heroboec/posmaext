@@ -69,6 +69,7 @@ function scReviewRender() {
         job.check?.reason ? scReasons[job.check.reason] || 'Источник не предоставил результат' : '',
         job.check?.result?.source_observed_at ? `Данные источника: ${job.check.result.source_observed_at}` : '',
         job.check?.previously_requested != null ? `Запрашивался ранее: ${job.check.previously_requested ? 'Да' : 'Нет'}` : '',
+        job.retryCount ? `Повторов: ${job.retryCount}/${PM_SOCIAL.retryLimit}` : '',
         job.error || '',
       ].filter(Boolean).join(' · ');
       scNode('td', detail || '—', tr).className = job.error ? 'error' : '';

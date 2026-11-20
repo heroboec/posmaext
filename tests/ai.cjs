@@ -77,13 +77,14 @@ test('AI: uses full row with title and fallback format; persists only verified l
   assert.equal(w.requests.length, 1, 'already extracted identifiers are not re-extracted');
 });
 
-test('AI: malformed or invented identifier retried at most three times without echoing secrets', async () => {
+test('AI: malformed identifier gets ten retries two seconds apart without echoing secrets', async () => {
   const w = setup(); await w.configure(); const run = await w.create(); let attempts = 0;
   w.ctx.fetch = async () => { attempts++; return { ok: true, status: 200, headers: new Headers(), json: async () => ({
     choices: [{ message: { content: '{"accounts":[{"index":0,"type":"username","identifier":"invented_user"}]}' } }],
   }) }; };
   const result = await w.extract(run);
-  assert.equal(result.ok, false); assert.equal(attempts, 3);
+  assert.equal(result.ok, false); assert.equal(attempts, 11);
+  assert.deepEqual(w.waits, Array(10).fill(2000));
   const pack = await w.ctx.db.get('package:' + run.id);
   assert.equal(pack.entries[0].jobs.length, 0);
   assert.doesNotMatch(pack.entries[0].extractionError, /invented_user|SYNTHETIC_PASSWORD/);
@@ -94,9 +95,38 @@ test('AI: retries 429 with Retry-After but not invalid credentials', async () =>
     const w = setup(); await w.configure(); const run = await w.create(); let attempts = 0;
     w.ctx.fetch = async () => { attempts++; return { ok: false, status, headers: new Headers({ 'Retry-After': '4' }) }; };
     assert.equal((await w.extract(run)).ok, false);
-    assert.equal(attempts, status === 429 ? 3 : 1);
+    assert.equal(attempts, status === 429 ? 11 : 1);
     if (status === 429) assert.ok(w.waits.includes(4000));
   }
+});
+test('AI: an undetermined login is retried two seconds apart and can recover', async () => {
+  const w = setup(); await w.configure(); const run = await w.create(); let attempts = 0;
+  w.ctx.fetch = async () => ({ ok: true, status: 200, headers: new Headers(), json: async () => ({
+    choices: [{ message: { content: JSON.stringify({ accounts: [
+      { index: 0, type: 'username', identifier: ++attempts < 4 ? null : 'test_user' },
+    ] }) } }],
+  }) });
+  assert.equal((await w.extract(run)).ok, true);
+  assert.equal(attempts, 4); assert.deepEqual(w.waits, [2000,2000,2000]);
+  assert.equal((await w.ctx.db.get('package:' + run.id)).entries[0].jobs[0].query.identifier, 'test_user');
+});
+test('AI: retries send only unresolved rows and preserve an already extracted login', async () => {
+  const w = setup(); await w.configure(); const run = await w.create(), inputs = []; let attempts = 0;
+  w.ctx.fetch = async (url, init) => {
+    const input = JSON.parse(JSON.parse(init.body).messages[1].content).rows;
+    inputs.push(input.map(r => r.value)); attempts++;
+    return { ok: true, status: 200, headers: new Headers(), json: async () => ({
+      choices: [{ message: { content: JSON.stringify({ accounts: input.map((row, index) => ({
+        index, type: 'username', identifier: attempts === 1 && row.value.startsWith('second:') ? null : row.value.split(':')[0],
+      })) }) } }],
+    }) };
+  };
+  assert.equal((await w.extract(run, '42', ['alpha:beta:SYNTHETIC_PASSWORD', 'second:SYNTHETIC_PASSWORD'])).ok, true);
+  const jobs = (await w.ctx.db.get('package:' + run.id)).entries[0].jobs;
+  assert.deepEqual(jobs.map(j => j.query.identifier), ['alpha', 'second']);
+  assert.equal(attempts, 2);
+  assert.deepEqual(inputs.map(rows => rows.length), [2,1]);
+  assert.equal(inputs[1][0], 'second:SYNTHETIC_PASSWORD');
 });
 
 test('AI: bounded concurrency, cancellation blocks queued requests and late saves', async () => {

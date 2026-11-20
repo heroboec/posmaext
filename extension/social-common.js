@@ -43,5 +43,6 @@ const PM_SOCIAL = (() => {
     return !!json && !json.error && json.status !== 'error' &&
       (json.code === 0 || json.status === 'ok' || json.status === 'success' || json.success === true);
   }
-  return { defaults, fields, statuses, normalize, valid, rows, sample, types, serverSuccess };
+  return { defaults, fields, statuses, normalize, valid, rows, sample, types, serverSuccess,
+    retryLimit: 10, retryDelay: 2000 };
 })();

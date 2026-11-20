@@ -31,7 +31,7 @@ function scBackoff(retry = 0) {
   const task = scLimitSerial.then(async () => {
     const limit = await PM_DB.get('api-limit') || { next: 0, failures: 0 };
     limit.failures++;
-    limit.next = Math.max(limit.next, Date.now() + Math.max(retry, Math.min(60000, 2500 * 2 ** Math.min(limit.failures, 5))));
+    limit.next = Math.max(limit.next, Date.now() + Math.max(retry, PM_SOCIAL.retryDelay));
     await PM_DB.set('api-limit', limit);
   });
   scLimitSerial = task.catch(() => {});
@@ -74,9 +74,9 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
     });
   } catch (_) {
     await scBackoff();
-    throw new Error('Сетевой сбой. Результат отправки неизвестен; повтор использует прежний ключ');
+    throw Object.assign(new Error('Сетевой сбой. Результат отправки неизвестен; повтор использует прежний ключ'), { retryable: true });
   }
-  if (response.status === 429 || response.status >= 500) {
+  if ([408, 425, 429].includes(response.status) || response.status >= 500) {
     const header = response.headers.get('Retry-After');
     const retry = header && /^\d+(\.\d+)?$/.test(header) ? Number(header) * 1000 : Math.max(0, Date.parse(header) - Date.now()) || 0;
     await scBackoff(retry);
@@ -86,11 +86,15 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
       403: 'Доступ запрещён', 409: 'Конфликт ключа идемпотентности', 429: 'Лимит API: повторите позднее', 503: 'Биллинг временно недоступен' };
     const error = new Error(messages[response.status] || `API: HTTP ${response.status}`);
     error.httpStatus = response.status;
+    error.retryable = [408, 425, 429].includes(response.status) || response.status >= 500;
     throw error;
   }
   await scRecovered();
   let json;
-  try { json = await response.json(); } catch (_) { throw new Error('API вернул некорректный JSON; повторите с прежним ключом'); }
+  try { json = await response.json(); } catch (_) {
+    await scBackoff();
+    throw Object.assign(new Error('API вернул некорректный JSON; повтор использует прежний ключ'), { retryable: true });
+  }
   return json;
 }
 function scCleanEntry(entry) {
@@ -254,7 +258,7 @@ async function scHandle(msg, sender) {
   if (msg.action === 'sc-submit' && job.rejected) throw new Error('Запрос отклонён API. Автоматический новый платный запрос запрещён');
   if (msg.action === 'sc-refresh' && !job.check?.id) return {};
   // Keys and exact query already durably stored at package creation, before any POST.
-  job.error = null; job.attempted = true; await scSave(pack);
+  job.error = null; job.retryCount = 0; job.attempted = true; await scSave(pack);
   const running = scRunCheck(msg, pack, entry, job, owner);
   scInFlight.set(slot, running);
   running.then(() => scInFlight.delete(slot), () => scInFlight.delete(slot));
@@ -262,29 +266,38 @@ async function scHandle(msg, sender) {
 }
 async function scRunCheck(msg, pack, entry, job, owner) {
   let error;
-  try {
-    const request = { owner, binding: pack.binding, preflight: async () => {
-      const latest = await scPackage(pack.id);
-      if (latest.entries.find(e => e.bidId === entry.bidId)?.jobs[msg.job]?.key !== job.key) throw new Error('Проверка в пакете изменилась');
-      if (latest.auto && msg.action === 'sc-submit') {
-        if (latest.aiPaused && !msg.manual) throw new Error('Подготовка приостановлена. Повторите извлечение или продолжите вручную');
-        const snapshot = await scSource(latest, 'snapshot');
-        if (snapshot.entries.find(e => e.bidId === entry.bidId)?.status !== entry.status) throw new Error('Строка или статус изменились. Сверьте статусы перед проверкой');
-      }
-    } };
-    const check = msg.action === 'sc-submit'
-      ? await scApi('checks', { ...request, method: 'POST', query: job.query, key: job.key })
-      : await scApi('checks/' + encodeURIComponent(job.check.id), request);
-    if (typeof check.id !== 'string' || !Object.hasOwn(PM_SOCIAL.statuses, check.status) ||
-        !check.query || check.query.platform !== job.query.platform || check.query.identifier_type !== job.query.identifier_type ||
-        PM_SOCIAL.normalize(job.query.identifier_type, check.query.identifier || '') !== PM_SOCIAL.normalize(job.query.identifier_type, job.query.identifier) ||
-        (job.check?.id && job.check.id !== check.id)) throw new Error('Некорректный ответ проверки; повторите с прежним ключом');
-    job.check = check;
-  } catch (e) {
-    job.error = e.message;
-    // Auth/balance/limit are safe to resume manually. No fresh keys on any retry.
-    if ([400, 409].includes(e.httpStatus)) job.rejected = true;
-    error = e;
+  for (let attempt = 0; attempt <= PM_SOCIAL.retryLimit; attempt++) {
+    try {
+      const request = { owner, binding: pack.binding, preflight: async () => {
+        const latest = await scPackage(pack.id);
+        if (latest.entries.find(e => e.bidId === entry.bidId)?.jobs[msg.job]?.key !== job.key) throw new Error('Проверка в пакете изменилась');
+        if (latest.auto && msg.action === 'sc-submit') {
+          if (latest.aiPaused && !msg.manual) throw new Error('Подготовка приостановлена. Повторите извлечение или продолжите вручную');
+          const snapshot = await scSource(latest, 'snapshot');
+          if (snapshot.entries.find(e => e.bidId === entry.bidId)?.status !== entry.status) throw new Error('Строка или статус изменились. Сверьте статусы перед проверкой');
+        }
+      } };
+      const check = msg.action === 'sc-submit'
+        ? await scApi('checks', { ...request, method: 'POST', query: job.query, key: job.key })
+        : await scApi('checks/' + encodeURIComponent(job.check.id), request);
+      if (typeof check?.id !== 'string' || !Object.hasOwn(PM_SOCIAL.statuses, check.status) ||
+          !check.query || check.query.platform !== job.query.platform || check.query.identifier_type !== job.query.identifier_type ||
+          typeof check.query.identifier !== 'string' ||
+          PM_SOCIAL.normalize(job.query.identifier_type, check.query.identifier) !== PM_SOCIAL.normalize(job.query.identifier_type, job.query.identifier) ||
+          (job.check?.id && job.check.id !== check.id)) throw Object.assign(new Error('Некорректный ответ проверки; повтор использует прежний ключ'), { retryable: true });
+      job.check = check; job.error = null; error = null; break;
+    } catch (e) {
+      job.error = e.message;
+      if ([400, 409].includes(e.httpStatus)) job.rejected = true;
+      error = e;
+      if (!e.retryable || attempt === PM_SOCIAL.retryLimit) break;
+      try {
+        scAssertLive(owner);
+        await scSleep(PM_SOCIAL.retryDelay);
+        scAssertLive(owner);
+        job.retryCount = attempt + 1;
+      } catch (cancel) { job.error = cancel.message; error = cancel; break; }
+    }
   }
   await scExclusive(async () => {
     // Other requests, DOM sync and manual decisions may have changed this package.
@@ -293,6 +306,7 @@ async function scRunCheck(msg, pack, entry, job, owner) {
     const target = latest.entries.find(e => e.bidId === entry.bidId)?.jobs[msg.job];
     if (!target || target.key !== job.key) throw new Error('Проверка в пакете изменилась');
     target.error = job.error;
+    target.retryCount = job.retryCount || 0;
     if (job.check) target.check = job.check;
     if (job.rejected) target.rejected = true;
     await scSave(latest);

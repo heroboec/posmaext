@@ -86,6 +86,69 @@ test('worker protects key/settings and persists only compact selected values wit
   assert.equal((await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' })).ok, true);
   assert.equal(w.requests.length, 1);
 });
+test('check retries: ten automatic retries, fixed two-second delay and identical idempotency key', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(), requests = [];
+  w.context.fetch = async (url, options) => {
+    requests.push({ at: w.context.Date.now(), key: options.headers['Idempotency-Key'], query: options.body });
+    return { ok: requests.length === 11, status: requests.length === 11 ? 202 : 503, headers: new Headers(),
+      json: async () => ({ id: 'synthetic-check', status: 'pending', query: JSON.parse(options.body) }) };
+  };
+  assert.equal((await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' })).ok, true);
+  assert.equal(requests.length, 11);
+  assert.ok(requests.every(r => r.key === requests[0].key && r.query === requests[0].query));
+  assert.deepEqual(requests.slice(1).map((r, i) => r.at - requests[i].at), Array(10).fill(2000));
+  const job = (await w.send({ action: 'sc-get', id })).package.entries[0].jobs[0];
+  assert.equal(job.retryCount, 10); assert.equal(job.error, null);
+});
+test('check retries: persistent network error stops after eleven attempts, not forever', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(); let attempts = 0;
+  w.context.fetch = async () => { attempts++; throw new TypeError('SYNTHETIC_FAILURE'); };
+  assert.equal((await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' })).ok, false);
+  assert.equal(attempts, 11);
+});
+test('check retries: malformed GET result is retried without another paid POST', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(), requests = [];
+  await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  w.context.fetch = async (url, options) => {
+    requests.push({ method: options.method, at: w.context.Date.now() });
+    return { ok: true, status: 200, headers: new Headers(), json: async () => {
+      if (requests.length < 3) throw new SyntaxError('Synthetic invalid JSON');
+      return { id: 'check-1', status: 'found', query: { platform: 'instagram', identifier_type: 'username', identifier: 'test_profile_a' } };
+    } };
+  };
+  assert.equal((await w.send({ action: 'sc-refresh', id, bidId: '42', job: 0, client: 'client' })).ok, true);
+  assert.deepEqual(requests.map(r => r.method), ['GET','GET','GET']);
+  assert.equal(requests[1].at - requests[0].at, 2000);
+});
+test('check retries: closing the requesting review prevents the next retry', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(), timers = [];
+  const close = w.connect(id, 'stopper'); let attempts = 0;
+  w.context.setTimeout = (fn, ms) => { if (ms > 0) timers.push({ fn, ms }); else queueMicrotask(fn); };
+  w.context.fetch = async () => { attempts++; throw new TypeError('SYNTHETIC_FAILURE'); };
+  const request = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'stopper' });
+  for (let i = 0; i < 100 && !timers.length; i++) await settle();
+  assert.equal(timers[0]?.ms, 2000);
+  close(); w.advance(timers[0].ms); timers[0].fn();
+  assert.equal((await request).ok, false); assert.equal(attempts, 1);
+});
+test('check retries: permanent credentials, balance and parameter errors do not loop', async () => {
+  for (const status of [400,401,402,403,404,409]) {
+    const w = worker(); await w.setup(); const id = await w.create(); let attempts = 0;
+    w.context.fetch = async () => { attempts++; return { ok: false, status, headers: new Headers() }; };
+    assert.equal((await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' })).ok, false);
+    assert.equal(attempts, 1);
+  }
+});
+test('check retries: changing store settings during a delay prevents sending to the new server', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(), timers = []; let attempts = 0;
+  w.context.setTimeout = (fn, ms) => { if (ms > 0) timers.push({ fn, ms }); else queueMicrotask(fn); };
+  w.context.fetch = async () => { attempts++; throw new TypeError('SYNTHETIC_FAILURE'); };
+  const request = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  for (let i = 0; i < 100 && !timers.length; i++) await settle();
+  await w.send({ action: 'sc-config-save', config: { url: 'https://other.example.test/', key: 'OTHER_TEST_KEY', mapping: {} } }, optionsSender);
+  w.advance(timers[0].ms); timers[0].fn();
+  assert.equal((await request).ok, false); assert.equal(attempts, 1);
+});
 test('API starts concurrent checks without spacing and merges reverse results without losing sibling jobs or source status', async () => {
   const w = worker(); await w.setup(); const id = await w.create();
   const pending = [];
@@ -132,32 +195,36 @@ test('deleting a package during cooldown prevents its still-unsent paid POST', a
 });
 test('successful recovery resets failures before the next independent error', async () => {
   const w = worker(); await w.setup(); const id = await w.create();
+  const request = { method: 'POST', key: 'synthetic-key',
+    query: { platform: 'instagram', identifier_type: 'username', identifier: 'test_profile_a' } };
   let status = 500;
   w.context.fetch = async (url, options) => ({ ok: status === 202, status, headers: new Headers(),
     json: async () => ({ id: 'synthetic-check', status: 'pending', query: JSON.parse(options.body) }) });
-  await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  await assert.rejects(w.context.api.scApi('checks', request), { httpStatus: 500 });
   status = 202;
-  assert.equal((await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' })).ok, true);
+  await w.context.api.scApi('checks', request);
   assert.equal((await w.context.api.db.get('api-limit')).failures, 0);
   status = 500;
-  await w.send({ action: 'sc-submit', id, bidId: '42', job: 1, client: 'client' });
+  await assert.rejects(w.context.api.scApi('checks', request), { httpStatus: 500 });
   const limit = await w.context.api.db.get('api-limit');
   assert.equal(limit.failures, 1);
-  assert.equal(limit.next - w.context.Date.now(), 5000);
+  assert.equal(limit.next - w.context.Date.now(), 2000);
 });
 test('a concurrent successful response does not erase another requests Retry-After', async () => {
   const w = worker(); await w.setup(); const id = await w.create(), pending = [];
   w.context.fetch = (url, options) => new Promise(resolve => pending.push({ resolve, options }));
-  const first = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
-  const second = w.send({ action: 'sc-submit', id, bidId: '42', job: 1, client: 'client' });
+  const request = { method: 'POST', key: 'synthetic-key',
+    query: { platform: 'instagram', identifier_type: 'username', identifier: 'test_profile_a' } };
+  const first = w.context.api.scApi('checks', request);
+  const second = w.context.api.scApi('checks', request);
   for (let i = 0; i < 100 && pending.length < 2; i++) await settle();
   assert.equal(pending.length, 2);
   pending[0].resolve({ ok: false, status: 429, headers: new Headers({ 'Retry-After': '12' }) });
-  assert.equal((await first).ok, false);
+  await assert.rejects(first, { httpStatus: 429 });
   const limit = await w.context.api.db.get('api-limit');
   pending[1].resolve({ ok: true, status: 202, headers: new Headers(), json: async () => ({
     id: 'synthetic-check', status: 'pending', query: JSON.parse(pending[1].options.body) }) });
-  assert.equal((await second).ok, true);
+  await second;
   assert.equal((await w.context.api.db.get('api-limit')).next, limit.next);
   assert.ok(limit.next - w.context.Date.now() >= 12000);
 });
