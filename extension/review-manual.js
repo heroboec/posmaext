@@ -18,7 +18,7 @@ async function scReviewManual(entry) {
   dialog.setAttribute('aria-labelledby', 'manual-title');
   overlay.append(dialog); root.append(style, overlay); document.body.append(host);
   scNode('h2', `Выбор столбца · заявка #${entry.bidId}`, dialog).id = 'manual-title';
-  scNode('p', 'Здесь показаны данные аккаунтов, включая возможные пароли и cookies. Не публикуйте их. Выбирайте именно публичный логин, не почту или пароль.', dialog).className = 'warning';
+  scNode('p', 'Здесь показаны данные аккаунтов, включая возможные пароли и cookies. Не публикуйте их. Выбирайте публичный логин, ID или профильную ссылку, не почту или пароль.', dialog).className = 'warning';
   scNode('p', 'Выбор применяется ко всем ещё нераспознанным строкам этой поставки. Уже найденные логины и проверки не изменяются. ИИ не вызывается; новые логины будут проверены Social Check автоматически, если очередь не приостановлена (проверки могут быть платными).', dialog);
   const status = scNode('p', 'Читаю полные строки из исходной вкладки…', dialog); status.setAttribute('role', 'status');
   const tools = scNode('div', undefined, dialog); tools.className = 'tools';
@@ -52,7 +52,7 @@ async function scReviewManual(entry) {
   });
   function render(reset = false) {
     if (!data) return;
-    const rows = data.rows.map(row => row.value.split(delimiter.value));
+    const rows = data.rows.map(row => PM_SOCIAL.splitColumns(row.value, delimiter.value));
     const width = Math.min(1001, rows.reduce((max, row) => Math.max(max, row.length), 0));
     if (reset) {
       column.replaceChildren(); scNode('option', 'Выберите столбец', column).value = '';
@@ -77,7 +77,7 @@ async function scReviewManual(entry) {
     });
     const values = data.rows.map(row => row.value);
     const selection = column.value === '' ? [] : PM_SOCIAL.manualColumn(values, values.map((_, i) => i),
-      delimiter.value, Number(column.value), data.platform, type.value);
+      delimiter.value, Number(column.value), data.platform, type.value, data.types);
     const valid = selection.filter(row => row.identifier).length;
     count.textContent = `Предпросмотр первых ${Math.min(10, rows.length)} из ${rows.length} нераспознанных строк; длинные поля сокращены. ` +
       (column.value === '' ? 'Выберите столбец.' : `Корректных значений: ${valid}; останутся нераспознанными: ${rows.length - valid}. Формат не отличает пароль от ника — проверьте выбор.`);
@@ -107,8 +107,9 @@ async function scReviewManual(entry) {
     const result = await scReviewMessage({ action: 'ai-manual-preview', bidId: entry.bidId });
     if (!host.isConnected) return;
     data = result;
-    for (const value of data.types) scNode('option', value === 'username' ? 'Логин' : 'ID', type).value = value;
-    status.textContent = 'Разделитель применяется буквально. Двоеточия внутри URL и cookies тоже разделяют столбцы: проверьте предпросмотр.';
+    scNode('option', 'Авто: логин, ID или ссылка', type).value = 'auto';
+    for (const value of data.types) scNode('option', value === 'username' ? 'Логин / ссылка' : 'ID / ссылка', type).value = value;
+    status.textContent = 'Профильные HTTPS-ссылки преобразуются в логин или ID без открытия сайта. Двоеточие в https:// не делит столбец; остальные разделители внутри данных учитываются — проверьте предпросмотр.';
     render(true);
   } catch (e) { if (host.isConnected) { status.textContent = e.message; status.className = 'error'; } }
 }

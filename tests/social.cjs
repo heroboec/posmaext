@@ -68,6 +68,14 @@ test('sampling: random without replacement, normalized duplicates, one value, ma
   assert.equal(common.valid('instagram', 'id', '123456'), false);
   assert.deepEqual(plain(common.types([{ ...catalog[0], identifier_types: ['username', 'url'] }], 'instagram')), ['username']);
 });
+test('settings accept Facebook category mapping without changing other platforms', async () => {
+  const w = worker(); await w.setup();
+  const mapping = { Instagram: 'instagram', Facebook: 'facebook', Twitter: 'x', TikTok: 'tiktok', Reddit: 'reddit' };
+  const result = await w.send({ action: 'sc-config-save', config: { url: 'https://api.example.test/',
+    key: 'SYNTHETIC_API_KEY', mapping } }, optionsSender);
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual((await w.send({ action: 'sc-config-get' }, optionsSender)).mapping, mapping);
+});
 test('worker protects key/settings and persists only compact selected values with keys BEFORE POST', async () => {
   const w = worker(); await w.setup(); const id = await w.create();
   assert.equal((await w.send({ action: 'sc-config-get' }, contentSender)).ok, false);

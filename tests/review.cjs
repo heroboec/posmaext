@@ -148,6 +148,29 @@ test('manual chooser: hidden for successful/pending or non-automatic bids', asyn
     finally { s.dom.window.close(); }
   }
 });
+test('manual chooser: profile URL stays in one colon-delimited column; auto type is offered and sent', async () => {
+  const s = await review([], false, { auto: true, entry: { extractionState: 'error', extractionError: 'Synthetic unresolved login' } });
+  try {
+    const send = s.w.chrome.runtime.sendMessage;
+    s.w.chrome.runtime.sendMessage = async msg => {
+      if (msg.action !== 'ai-manual-preview') return send(msg);
+      s.messages.push(msg);
+      return { ok: true, rows: [{ index: 0, value: 'https://facebook.com/profile.php?id=123456:SYNTHETIC_PASSWORD' }],
+        digest: 'synthetic-digest', runId: 'synthetic-run', types: ['username', 'id'], platform: 'facebook' };
+    };
+    s.w.document.querySelector('.pm-manual-open').click(); await settle();
+    const root = s.w.document.querySelector('.pm-modal-backdrop').shadowRoot;
+    assert.equal(root.querySelector('.pm-manual-type').value, 'auto');
+    assert.deepEqual([...root.querySelectorAll('thead th')].map(n => n.textContent), ['Исходная строка', 'Столбец 1', 'Столбец 2']);
+    assert.equal(root.querySelector('tbody td:nth-child(2)').textContent, 'https://facebook.com/profile.php?id=123456');
+    const column = root.querySelector('.pm-manual-column'); column.value = '0'; column.dispatchEvent(new s.w.Event('change'));
+    assert.equal(root.querySelector('.pm-manual-apply').disabled, false);
+    root.querySelector('.pm-manual-apply').click(); await settle();
+    const msg = s.messages.find(m => m.action === 'ai-manual-apply');
+    assert.equal(msg.type, 'auto'); assert.equal(msg.column, 0);
+    assert.doesNotMatch(JSON.stringify(msg), /SYNTHETIC_PASSWORD|123456/);
+  } finally { s.dom.window.close(); }
+});
 test('diagnostics window is optional, renders source and responses as text and makes no paid requests', async () => {
   const s = await review([job('failed')], false, { diagnostics: {
     available: true, rowChoices: [{ id: 1, index: 0, time: 1000 }],

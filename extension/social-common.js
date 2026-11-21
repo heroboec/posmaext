@@ -2,7 +2,18 @@
 
 // Pure helpers shared by the isolated content script, worker and review page.
 const PM_SOCIAL = (() => {
-  const defaults = { Instagram: 'instagram', Twitter: 'x', X: 'x', TikTok: 'tiktok', YouTube: 'youtube', Reddit: 'reddit' };
+  const defaults = { Instagram: 'instagram', Facebook: 'facebook', Twitter: 'x', X: 'x', TikTok: 'tiktok', YouTube: 'youtube', Reddit: 'reddit' };
+  const supported = { instagram: ['username'], facebook: ['username', 'id'], x: ['username'],
+    tiktok: ['username', 'id'], youtube: ['username', 'id'], reddit: ['username'] };
+  const hosts = { instagram: ['instagram.com', 'www.instagram.com'], facebook: ['facebook.com', 'www.facebook.com'],
+    x: ['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com'], tiktok: ['tiktok.com', 'www.tiktok.com'],
+    youtube: ['youtube.com', 'www.youtube.com'], reddit: ['reddit.com', 'www.reddit.com'] };
+  const reserved = {
+    instagram: ['p', 'reel', 'reels', 'stories', 'explore', 'accounts', 'direct'],
+    facebook: ['share', 'sharer', 'sharer.php', 'profile.php', 'watch', 'reel', 'reels', 'stories',
+      'groups', 'events', 'marketplace', 'login', 'pages', 'photo.php'],
+    x: ['home', 'explore', 'search', 'i', 'intent', 'settings', 'messages', 'notifications', 'login', 'signup'],
+  };
   const fields = { external_id: 'ID', username: 'Юзернейм', display_name: 'Имя', bio: 'Описание',
     profile_url: 'Ссылка', avatar_url: 'Аватар', registration_date: 'Регистрация', posts: 'Публикации',
     friends: 'Друзья', followers: 'Подписчики', following: 'Подписки' };
@@ -12,13 +23,63 @@ const PM_SOCIAL = (() => {
   function valid(platform, type, value) {
     if (typeof value !== 'string') return false;
     value = normalize(type, value);
-    if (type === 'id') return platform === 'tiktok' ? /^\d+$/.test(value) : platform === 'youtube' && /^UC[\w-]{22}$/.test(value);
+    if (type === 'id') return ['facebook', 'tiktok'].includes(platform) ? /^\d{1,100}$/.test(value) : platform === 'youtube' && /^UC[\w-]{22}$/.test(value);
     if (type !== 'username') return false;
     const patterns = { instagram: /^[a-zA-Z0-9._]{1,30}$/, x: /^[a-zA-Z0-9_]{1,15}$/,
-      tiktok: /^[a-zA-Z0-9._]{1,24}$/, youtube: /^[a-zA-Z0-9_.-]{3,30}$/, reddit: /^[a-zA-Z0-9_-]{3,20}$/ };
-    if (platform === 'instagram' && ['p', 'reel', 'reels', 'stories', 'explore'].includes(value)) return false;
+      facebook: /^[a-zA-Z0-9_.-]{1,100}$/, tiktok: /^[a-zA-Z0-9._]{1,24}$/,
+      youtube: /^[a-zA-Z0-9_.-]{3,30}$/, reddit: /^[a-zA-Z0-9_-]{3,20}$/ };
+    if (reserved[platform]?.includes(value)) return false;
     return !!patterns[platform]?.test(value);
   }
+  function profileURL(platform, value) {
+    // No network, redirect following, decoding blobs or accepting arbitrary hosts.
+    if (typeof value !== 'string' || value.length > 500 || !/^https:\/\//i.test(value) ||
+        /[\s\\%]/.test(value)) return null;
+    let url;
+    try { url = new URL(value); } catch (_) { return null; }
+    if (!hosts[platform]?.includes(url.hostname) || url.username || url.password || url.port || url.hash ||
+        value.includes('#') || /\/\.{1,2}(?:\/|$)/.test(value)) return null;
+    // Check the original authority as URL() silently drops a default :443 port.
+    if (!hosts[platform].includes(value.slice(8).split('/')[0].toLowerCase())) return null;
+    const parts = url.pathname.replace(/^\/|\/$/g, '').split('/');
+    let type = 'username', identifier;
+    if (platform === 'facebook' && url.pathname === '/profile.php' && /^\?id=\d+$/.test(url.search)) {
+      type = 'id'; identifier = url.search.slice(4);
+    } else {
+      if (url.search || value.includes('?')) return null;
+      if (platform === 'reddit' && parts.length === 2 && ['u', 'user'].includes(parts[0])) identifier = parts[1];
+      else if (platform === 'youtube' && parts.length === 2 && parts[0] === 'channel') {
+        type = 'id'; identifier = parts[1];
+      } else if (parts.length === 1 && platform !== 'reddit') {
+        identifier = parts[0];
+        if (['tiktok', 'youtube'].includes(platform) && !identifier.startsWith('@')) return null;
+        if (platform === 'facebook' && /^\d+$/.test(identifier)) type = 'id';
+      } else return null;
+    }
+    return valid(platform, type, identifier) ? { type, identifier: normalize(type, identifier) } : null;
+  }
+  function resolve(platform, type, value, allowed = supported[platform] || []) {
+    if (typeof value !== 'string' || !['auto', 'url', 'username', 'id'].includes(type)) return null;
+    value = value.trim();
+    const url = /^https?:\/\//i.test(value);
+    let result;
+    if (url) {
+      result = profileURL(platform, value);
+      if (!result || (type === 'id' && result.type !== 'id')) return null;
+    } else {
+      if (type === 'url') return null;
+      if (platform === 'facebook' && /^\d+$/.test(value.replace(/^@/, ''))) value = value.replace(/^@/, '');
+      const kind = (platform === 'facebook' && /^\d+$/.test(value)) ||
+        (type === 'auto' && ((platform === 'tiktok' && /^\d+$/.test(value)) ||
+          (platform === 'youtube' && /^UC[\w-]{22}$/.test(value)))) ? 'id' :
+        type === 'auto' ? 'username' : type;
+      if (!valid(platform, kind, value)) return null;
+      result = { type: kind, identifier: normalize(kind, value) };
+    }
+    return allowed.includes(result.type) ? result : null;
+  }
+  // A scheme colon is part of the link, not a separate account column.
+  const splitColumns = (row, delimiter) => delimiter === ':' ? row.split(/:(?!\/\/)/) : row.split(delimiter);
   function rows(response) {
     if (response?.code !== 0 || !Array.isArray(response.list) || response.list.some(x => typeof x?.data !== 'string')) {
       throw new Error('Неожиданный ответ списка товаров (ожидается code: 0 и list[].data)');
@@ -37,19 +98,21 @@ const PM_SOCIAL = (() => {
   }
   function types(catalog, platform) {
     return [...new Set((catalog || []).filter(p => p.platform === platform && p.object_type === 'profile' && p.operation === 'fetch')
-      .flatMap(p => p.identifier_types || []).filter(t => t === 'username' || t === 'id'))];
+      .flatMap(p => p.identifier_types || []).filter(t => supported[platform]?.includes(t)))];
   }
   function serverSuccess(json) {
     return !!json && !json.error && json.status !== 'error' &&
       (json.code === 0 || json.status === 'ok' || json.status === 'success' || json.success === true);
   }
-  function manualColumn(rows, indexes, delimiter, column, platform, type) {
+  function manualColumn(rows, indexes, delimiter, column, platform, type, allowed) {
     if (![':', ';', '|', '\t'].includes(delimiter) || !Number.isInteger(column) || column < 0 || column > 1000) throw new Error('Выберите разделитель и столбец');
     return indexes.map(index => {
-      const value = rows[index].split(delimiter)[column]?.trim() || '';
-      return { index, identifier: valid(platform, type, value) ? normalize(type, value) : null };
+      const value = splitColumns(rows[index], delimiter)[column]?.trim() || '';
+      const result = resolve(platform, type, value, allowed);
+      return { index, identifier: result?.identifier || null, type: result?.type || null };
     });
   }
   return { defaults, fields, statuses, normalize, valid, rows, sample, types, serverSuccess, manualColumn,
+    profileURL, resolve, splitColumns,
     retryLimit: 10, retryDelay: 2000 };
 })();

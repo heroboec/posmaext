@@ -506,3 +506,107 @@ test('manual column: a fully failed bid can be recovered after worker diagnostic
   assert.equal(pack.entries[0].extractionError, '');
   assert.equal(pack.entries[0].jobs[0].query.identifier, 'recovered_user');
 });
+test('AI: handles, numeric IDs and exact profile URLs produce canonical jobs for every requested platform', () => {
+  const w = setup(); vm.runInContext('globalThis.parseProfile = aiParse;', w.ctx);
+  const cases = [
+    ['instagram', 'username', 'https://instagram.com/Demo.Profile/', 'demo.profile', 'username'],
+    ['facebook', 'username', 'Demo.Profile', 'demo.profile', 'username'],
+    ['facebook', 'id', '123456', '123456', 'id'],
+    ['facebook', 'url', 'https://facebook.com/profile.php?id=123456', '123456', 'id'],
+    ['facebook', 'username', 'https://facebook.com/Demo.Profile', 'demo.profile', 'username'],
+    ['x', 'username', 'https://twitter.com/demo_profile', 'demo_profile', 'username'],
+    ['tiktok', 'id', '123456', '123456', 'id'],
+    ['tiktok', 'username', 'https://tiktok.com/@demo.profile', 'demo.profile', 'username'],
+    ['reddit', 'username', 'https://reddit.com/user/demo_profile', 'demo_profile', 'username'],
+  ];
+  for (const [platform, type, value, identifier, kind] of cases) {
+    const parsed = w.ctx.parseProfile({ choices: [{ message: { content: JSON.stringify({
+      accounts: [{ index: 0, type, identifier: value }],
+    }) } }] }, [value + ':SYNTHETIC_PASSWORD'], platform, ['username', 'id']);
+    assert.equal(parsed.jobs[0].query.identifier, identifier, value);
+    assert.equal(parsed.jobs[0].query.identifier_type, kind, value);
+    assert.doesNotMatch(JSON.stringify(parsed), /SYNTHETIC_PASSWORD/);
+  }
+});
+test('AI: a model cannot launder wrong-domain/post URLs into plausible usernames or invent a profile URL', () => {
+  const w = setup(); vm.runInContext('globalThis.parseProfile = aiParse;', w.ctx);
+  const cases = [
+    ['instagram', 'https://evil.example/demo.profile', 'demo.profile'],
+    ['instagram', 'https://instagram.com/p/demo.profile', 'demo.profile'],
+    ['facebook', 'https://facebook.com/groups/123456', '123456'],
+    ['facebook', 'https://facebook.com/profile.php?id=123456&token=SYNTHETIC', '123456'],
+    ['facebook', '{"name":"ds_user_id","value":"123456"}', '123456'],
+    ['facebook', 'ds_user_id=123456', '123456'],
+    ['x', 'https://x.com/demo_profile/status/123', 'demo_profile'],
+    ['reddit', 'https://reddit.com/r/demo_profile', 'demo_profile'],
+    ['instagram', 'https://evil.example/demo.profile', 'https://instagram.com/demo.profile'],
+    ['facebook', 'https://facebook.com/profile.php?id=987654', 'https://facebook.com/profile.php?id=123456'],
+  ];
+  for (const [platform, row, value] of cases) {
+    assert.throws(() => w.ctx.parseProfile({ choices: [{ message: { content: JSON.stringify({
+      accounts: [{ index: 0, type: 'username', identifier: value }],
+    }) } }] }, [row + ':SYNTHETIC_PASSWORD'], platform, ['username', 'id']), row);
+  }
+});
+test('Facebook pipeline: links and plain identifiers deduplicate, POST uses canonical query and accepts canonical API responses', async () => {
+  const w = setup(); await w.configure();
+  await w.ctx.db.set('catalog', [{ platform: 'facebook', object_type: 'profile', operation: 'fetch', identifier_types: ['username', 'id', 'url'] }]);
+  const run = await w.send({ action: 'sc-auto-create', packageId: webcrypto.randomUUID(),
+    entries: [{ bidId: '42', status: '2', platform: 'facebook', category: 'Facebook', properties: [] }] });
+  assert.equal(run.ok, true, run.error);
+  const values = ['Demo.Profile', 'https://www.facebook.com/Demo.Profile', '123456', 'https://facebook.com/profile.php?id=123456'];
+  w.ctx.fetch = async (url, init) => {
+    const input = JSON.parse(JSON.parse(init.body).messages[1].content).rows;
+    return { ok: true, status: 200, headers: new Headers(), json: async () => ({
+      choices: [{ message: { content: JSON.stringify({ accounts: input.map((row, index) => ({
+        index, type: 'username', identifier: values[index],
+      })) }) } }],
+    }) };
+  };
+  assert.equal((await w.extract(run, '42', values.map(value => value + ':SYNTHETIC_PASSWORD'))).ok, true);
+  const pack = await w.ctx.db.get('package:' + run.id), jobs = pack.entries[0].jobs;
+  assert.equal(jobs.length, 2);
+  assert.deepEqual(jobs.map(j => j.query), [
+    { platform: 'facebook', identifier_type: 'username', identifier: 'demo.profile' },
+    { platform: 'facebook', identifier_type: 'id', identifier: '123456' },
+  ]);
+  const requests = [];
+  w.ctx.fetch = async (url, init) => {
+    const query = JSON.parse(init.body); requests.push({ query, key: init.headers['Idempotency-Key'] });
+    return { ok: true, status: 202, headers: new Headers(), json: async () => ({ id: 'synthetic-' + query.identifier,
+      status: 'pending', query }) };
+  };
+  w.connect(run.id);
+  for (let job = 0; job < 2; job++) {
+    const result = await w.send({ action: 'sc-submit', id: run.id, bidId: '42', job, client: 'client' }, reviewPage);
+    assert.equal(result.ok, true, result.error);
+  }
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests.map(r => r.query), jobs.map(j => j.query));
+  assert.deepEqual(requests.map(r => r.key), jobs.map(j => j.key));
+  const after = await w.ctx.db.get('package:' + run.id);
+  assert.ok(after.entries[0].jobs.every(j => j.check?.id));
+  assert.doesNotMatch(JSON.stringify(after), /SYNTHETIC_PASSWORD|https:\/\/(?:www\.)?facebook\.com/);
+  const diagnostic = await w.send({ action: 'sc-diagnostics', id: run.id, bidId: '42', job: 0 }, reviewPage);
+  assert.equal(diagnostic.diagnostics.rows.length, 2, 'Canonical login diagnostics include both the handle and its URL source');
+});
+test('manual Facebook selection supports mixed links/IDs, deduplicates them and skips email and non-profile links', async () => {
+  const w = setup(); await w.configure();
+  await w.ctx.db.set('catalog', [{ platform: 'facebook', object_type: 'profile', operation: 'fetch', identifier_types: ['username', 'id', 'url'] }]);
+  const run = await w.send({ action: 'sc-auto-create', packageId: webcrypto.randomUUID(),
+    entries: [{ bidId: '42', status: '2', platform: 'facebook', category: 'Facebook', properties: [] }] });
+  const rows = ['https://facebook.com/Demo.Profile:SYNTHETIC_PASSWORD', '123456:SYNTHETIC_PASSWORD',
+    'https://facebook.com/profile.php?id=123456:SYNTHETIC_PASSWORD',
+    'https://facebook.com/groups/123:SYNTHETIC_PASSWORD', 'mail@example.test:SYNTHETIC_PASSWORD'];
+  w.ctx.fetch = async () => ({ ok: false, status: 401, headers: new Headers() });
+  await w.extract(run, '42', rows);
+  w.ctx.chrome.tabs.sendMessage = async () => ({ ok: true, rows });
+  const preview = await w.send({ action: 'ai-manual-preview', id: run.id, bidId: '42' }, reviewPage);
+  const result = await w.send({ action: 'ai-manual-apply', id: run.id, bidId: '42', digest: preview.digest,
+    runId: preview.runId, delimiter: ':', column: 0, type: 'auto' }, reviewPage);
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.added, 2); assert.equal(result.remaining, 2);
+  const entry = (await w.ctx.db.get('package:' + run.id)).entries[0];
+  assert.deepEqual(entry.jobs.map(j => j.query.identifier_type), ['username', 'id']);
+  assert.doesNotMatch(JSON.stringify(entry), /SYNTHETIC_PASSWORD|mail@example/);
+});
