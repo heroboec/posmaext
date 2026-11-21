@@ -13,7 +13,10 @@ const scLive = new Map();
 const scSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const scPage = (sender, page) => sender.url?.split('?')[0] === chrome.runtime.getURL(page);
 const scTrusted = sender => scPage(sender, 'options.html') || scPage(sender, 'review.html');
-async function scConfig() { return { ...scDefaultConfig, ...await PM_DB.get('config') }; }
+async function scConfig() {
+  const saved = await PM_DB.get('config');
+  return { ...scDefaultConfig, ...saved, mapping: { ...PM_SOCIAL.defaults, ...saved?.mapping } };
+}
 async function scBinding(config) {
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(config.url + '\n' + config.key));
   return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');

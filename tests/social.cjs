@@ -74,7 +74,30 @@ test('settings accept Facebook category mapping without changing other platforms
   const result = await w.send({ action: 'sc-config-save', config: { url: 'https://api.example.test/',
     key: 'SYNTHETIC_API_KEY', mapping } }, optionsSender);
   assert.equal(result.ok, true, result.error);
-  assert.deepEqual((await w.send({ action: 'sc-config-get' }, optionsSender)).mapping, mapping);
+  assert.deepEqual(plain((await w.send({ action: 'sc-config-get' }, optionsSender)).mapping), { ...plain(w.context.api.common.defaults), ...mapping });
+});
+test('default mappings: all eight categories are available before settings are saved', async () => {
+  const w = worker();
+  const expected = { Instagram: 'instagram', Twitter: 'x', X: 'x', 'x.com(Twitter)': 'x',
+    TikTok: 'tiktok', YouTube: 'youtube', Reddit: 'reddit', Facebook: 'facebook' };
+  assert.deepEqual(plain((await w.send({ action: 'sc-config-get' }, optionsSender)).mapping), expected);
+  assert.deepEqual(plain((await w.send({ action: 'sc-public' }, contentSender)).mapping), expected);
+});
+test('default mappings: missing categories appear in saved settings without overwriting custom mappings or API binding', async () => {
+  const w = worker(); await w.setup();
+  const saved = await w.context.api.db.get('config');
+  saved.mapping = { Instagram: 'reddit', 'Synthetic category': 'facebook' };
+  await w.context.api.db.set('config', saved);
+  const before = await w.context.api.scBinding(saved);
+  const options = await w.send({ action: 'sc-config-get' }, optionsSender);
+  assert.equal(options.mapping.Instagram, 'reddit');
+  assert.equal(options.mapping['Synthetic category'], 'facebook');
+  assert.equal(options.mapping['x.com(Twitter)'], 'x');
+  assert.equal(options.mapping.Facebook, 'facebook');
+  assert.deepEqual((await w.send({ action: 'sc-public' }, contentSender)).mapping, options.mapping);
+  const stored = await w.context.api.db.get('config');
+  assert.deepEqual(stored, saved, 'Reading defaults must not rewrite user settings or secrets');
+  assert.equal(await w.context.api.scBinding(stored), before);
 });
 test('worker protects key/settings and persists only compact selected values with keys BEFORE POST', async () => {
   const w = worker(); await w.setup(); const id = await w.create();

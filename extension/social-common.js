@@ -2,7 +2,8 @@
 
 // Pure helpers shared by the isolated content script, worker and review page.
 const PM_SOCIAL = (() => {
-  const defaults = { Instagram: 'instagram', Facebook: 'facebook', Twitter: 'x', X: 'x', TikTok: 'tiktok', YouTube: 'youtube', Reddit: 'reddit' };
+  const defaults = { Instagram: 'instagram', Twitter: 'x', X: 'x', 'x.com(Twitter)': 'x',
+    TikTok: 'tiktok', YouTube: 'youtube', Reddit: 'reddit', Facebook: 'facebook' };
   const supported = { instagram: ['username'], facebook: ['username', 'id'], x: ['username'],
     tiktok: ['username', 'id'], youtube: ['username', 'id'], reddit: ['username'] };
   const hosts = { instagram: ['instagram.com', 'www.instagram.com'], facebook: ['facebook.com', 'www.facebook.com'],

@@ -53,6 +53,9 @@ function scReviewRender() {
     if (entry.sourceStatus !== undefined && entry.sourceStatus !== entry.status) scNode('p', entry.sourceStatus === null ? 'Строка отсутствует в исходном списке' : `Конфликт: в админке статус ${scBidStatuses[entry.sourceStatus] || entry.sourceStatus}. Решение заблокировано`, article).className = 'error';
     const fields = Object.entries(PM_SOCIAL.fields).filter(([field]) =>
       !['avatar_url', 'profile_url', 'display_name', 'username', 'bio'].includes(field));
+    if (entry.platform === 'reddit' || entry.jobs.some(job => job.query.platform === 'reddit')) {
+      fields.push(['post_karma', 'Карма постов'], ['comment_karma', 'Карма комментариев']);
+    }
     const scroll = scNode('div', undefined, article); scroll.className = 'scroll';
     const table = scNode('table', undefined, scroll); table.className = 'accounts-table';
     const head = scNode('tr', undefined, scNode('thead', undefined, table));

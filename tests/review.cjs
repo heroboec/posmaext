@@ -44,6 +44,41 @@ test('account table keeps login in each row and omits avatar, link, name and bio
     assert.equal(cells[3], '2020-05-17');
   } finally { s.dom.window.close(); }
 });
+test('Reddit results show separate post/comment karma, preserve zero/negatives and never infer missing values', async () => {
+  const jobs = [0, -12, 3456, null].map((karma, i) => {
+    const profile = job('found');
+    profile.query.platform = 'reddit'; profile.query.identifier = 'synthetic_reddit_' + i;
+    profile.check.result.data.post_karma = karma;
+    profile.check.result.data.comment_karma = [12, 0, -34, null][i];
+    profile.check.result.data.karma = 9999;
+    return profile;
+  });
+  const s = await review(jobs, false, { entry: { platform: 'reddit', category: 'Reddit' } });
+  try {
+    const table = s.w.document.querySelector('.accounts-table');
+    const headers = [...table.querySelectorAll('th')].map(node => node.textContent);
+    const index = headers.indexOf('Карма постов');
+    assert.ok(index > 0);
+    assert.deepEqual([...table.querySelectorAll('tbody tr')].map(tr => tr.children[index].textContent),
+      ['0', '-12', '3456', 'Нет данных']);
+    const commentIndex = headers.indexOf('Карма комментариев');
+    assert.ok(commentIndex > 0);
+    assert.deepEqual([...table.querySelectorAll('tbody tr')].map(tr => tr.children[commentIndex].textContent),
+      ['12', '0', '-34', 'Нет данных']);
+  } finally { s.dom.window.close(); }
+  const other = await review([job('found')]);
+  try { assert.doesNotMatch(other.w.document.querySelector('thead').textContent, /Карма/); }
+  finally { other.dom.window.close(); }
+});
+test('an unresolved Reddit bid still has both karma columns and correct error row colspan', async () => {
+  const s = await review([], false, { entry: { platform: 'reddit', extractionError: 'Synthetic unresolved login' } });
+  try {
+    const table = s.w.document.querySelector('.accounts-table');
+    assert.match(table.querySelector('thead').textContent, /Карма постов/);
+    assert.match(table.querySelector('thead').textContent, /Карма комментариев/);
+    assert.equal(table.querySelector('tbody td:nth-child(2)').colSpan, table.querySelectorAll('th').length - 1);
+  } finally { s.dom.window.close(); }
+});
 test('automatic review submits ready logins, renders description and never auto-retries an uncertain POST', async () => {
   const j = { query: job('pending').query, key: 'synthetic-key', attempted: true, error: 'Synthetic network error' };
   const s = await review([j], false, { auto: true, entry: { title: 'Synthetic title', description: 'Synthetic multiline\ndescription' } });
