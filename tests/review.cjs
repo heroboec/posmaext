@@ -79,7 +79,7 @@ test('an unresolved Reddit bid still has both karma columns and correct error ro
     assert.equal(table.querySelector('tbody td:nth-child(2)').colSpan, table.querySelectorAll('th').length - 1);
   } finally { s.dom.window.close(); }
 });
-test('automatic review submits ready logins, renders description and never auto-retries an uncertain POST', async () => {
+test('automatic review submits ready logins but does not retry an unclassified legacy error blindly', async () => {
   const j = { query: job('pending').query, key: 'synthetic-key', attempted: true, error: 'Synthetic network error' };
   const s = await review([j], false, { auto: true, entry: { title: 'Synthetic title', description: 'Synthetic multiline\ndescription' } });
   try {
@@ -93,6 +93,145 @@ test('automatic review submits ready logins, renders description and never auto-
     assert.equal(submits[0].job, 1);
     assert.equal(submits[0].manual, false);
   } finally { s.dom.window.close(); }
+});
+test('automatic review restores a known uncertain POST with a remaining budget but leaves exhausted/auth errors stopped', async () => {
+  const uncertain = { query: job('pending').query, key: 'stable-key', attempted: true, retryCount: 1,
+    error: 'Сетевой сбой. Результат отправки неизвестен; повтор использует прежний ключ' };
+  const s = await review([uncertain, { ...uncertain, key: 'exhausted', retryCount: 10 },
+    { ...uncertain, key: 'auth', error: 'Неверный API-ключ' }], false, { auto: true });
+  try {
+    const submits = s.messages.filter(m => m.action === 'sc-submit');
+    assert.equal(submits.length, 1); assert.equal(submits[0].job, 0); assert.equal(submits[0].manual, false);
+  } finally { s.dom.window.close(); }
+});
+test('waiting and retrying rows show the actual stage, attempt, HTTP code and error cause', async () => {
+  const rows = [
+    { query: job('pending').query, key: 'sending', attempted: true, requestAction: 'sc-submit', requestState: 'sending', attemptCount: 1 },
+    { query: job('pending').query, key: 'retry', attempted: true, requestAction: 'sc-submit', requestState: 'retry_wait',
+      attemptCount: 2, retryAt: Date.now() + 2000, lastHttpStatus: 503, errorKind: 'server', error: 'Synthetic temporary server error' },
+    { query: job('pending').query, key: 'failed', attempted: true, requestAction: 'sc-submit', requestState: 'failed',
+      attemptCount: 11, retryCount: 10, retryable: true, errorKind: 'network', error: 'Synthetic offline' },
+  ];
+  const s = await review(rows);
+  try {
+    const rendered = [...s.w.document.querySelectorAll('.accounts-table tbody tr')];
+    assert.match(rendered[0].children[1].textContent, /Ожидание ответа на отправку · попытка 1\/11/);
+    assert.doesNotMatch(rendered[0].textContent, /Отправка не подтверждена/);
+    assert.match(rendered[1].textContent, /Повтор отправки через/);
+    assert.match(rendered[1].textContent, /попытка 3\/11/);
+    assert.match(rendered[1].textContent, /HTTP 503/);
+    assert.match(rendered[1].textContent, /Social Check или его прокси/);
+    assert.match(rendered[2].textContent, /попытки исчерпаны/);
+    assert.match(rendered[2].textContent, /сторона сбоя не установлена/);
+    assert.equal(rendered[2].querySelector('.pm-request-retry').disabled, false);
+  } finally { s.dom.window.close(); }
+});
+test('queued jobs are shown as queued rather than unconfirmed or sending', async () => {
+  const s = await review([{ query: job('pending').query, key: 'queued', attempted: true,
+    requestAction: 'sc-submit', requestState: 'queued', attemptCount: 0 }]);
+  try {
+    const row = s.w.document.querySelector('tbody tr');
+    assert.match(row.textContent, /В очереди отправки · лимит 5 запросов\/с/);
+    assert.doesNotMatch(row.textContent, /Отправка не подтверждена|Ожидание ответа/);
+    assert.equal(row.querySelector('.pm-request-retry'), null);
+  } finally { s.dom.window.close(); }
+});
+test('table progress redraws during a slow batch instead of waiting for every request to finish', async () => {
+  const j = { query: job('pending').query, key: 'stable-key' };
+  const s = await review([j]);
+  try {
+    Object.defineProperty(s.w.document, 'hidden', { value: false, configurable: true });
+    const send = s.w.chrome.runtime.sendMessage; let finish;
+    s.w.chrome.runtime.sendMessage = msg => msg.action === 'sc-submit'
+      ? new Promise(resolve => { finish = resolve; }) : send(msg);
+    s.w.document.getElementById('check').click(); await settle();
+    Object.assign(s.pack.entries[0].jobs[0], { attempted: true, requestState: 'retry_wait', requestAction: 'sc-submit',
+      attemptCount: 3, retryAt: Date.now() + 2000, errorKind: 'network', error: 'Synthetic transport failure' });
+    await s.intervals[0](); await settle();
+    assert.match(s.w.document.querySelector('tbody tr').textContent, /Повтор отправки через/);
+    assert.match(s.w.document.querySelector('tbody tr').textContent, /попытка 4\/11/);
+    assert.equal(s.w.document.getElementById('check').disabled, true);
+    finish({ ok: true }); await settle();
+  } finally { s.dom.window.close(); }
+});
+test('accepted results are polled while another POST is slow, with no duplicate dispatch', async () => {
+  const s = await review([job('found')], false, { auto: true });
+  try {
+    s.pack.entries[0].jobs.push({ query: { ...job('pending').query, identifier: 'slow_profile' }, key: 'slow-key' }, job('pending'));
+    await s.w.eval('scReviewLoad()');
+    const send = s.w.chrome.runtime.sendMessage; let finish, posts = 0;
+    s.w.chrome.runtime.sendMessage = msg => {
+      if (msg.action === 'sc-submit') { posts++; return new Promise(resolve => { finish = resolve; }); }
+      if (msg.action === 'sc-refresh') s.pack.entries[0].jobs[msg.job].check.status = 'found';
+      return send(msg);
+    };
+    s.w.document.getElementById('check').click(); await settle();
+    await s.intervals[0](); await settle();
+    assert.equal(posts, 1);
+    assert.equal(s.messages.filter(m => m.action === 'sc-refresh').length, 1);
+    assert.equal(s.w.document.querySelectorAll('tbody tr')[2].children[1].textContent, 'Найден');
+    await s.intervals[0](); await settle();
+    assert.equal(s.messages.filter(m => m.action === 'sc-refresh').length, 1);
+    finish({ ok: true }); await settle();
+  } finally { s.dom.window.close(); }
+});
+test('an automatic batch started by the interval never holds the progress-refresh lock', async () => {
+  const s = await review([job('found')], false, { auto: true });
+  try {
+    s.pack.entries[0].jobs.push({ query: { ...job('pending').query, identifier: 'slow_profile' }, key: 'slow-key' });
+    const send = s.w.chrome.runtime.sendMessage; let finish;
+    s.w.chrome.runtime.sendMessage = msg => msg.action === 'sc-submit'
+      ? new Promise(resolve => { finish = resolve; }) : send(msg);
+    await s.intervals[0](); await settle();
+    assert.equal(typeof finish, 'function');
+    Object.assign(s.pack.entries[0].jobs[1], { attempted: true, requestState: 'sending',
+      requestAction: 'sc-submit', attemptCount: 4 });
+    await s.intervals[0](); await settle();
+    assert.match(s.w.document.querySelectorAll('tbody tr')[1].textContent, /попытка 4\/11/);
+    finish({ ok: true }); await settle();
+  } finally { s.dom.window.close(); }
+});
+test('newly recognized logins enter the queue while another POST and another bid extraction remain unfinished', async () => {
+  const s = await review([job('found')], false, { auto: true });
+  try {
+    s.pack.entries[0].jobs.push({ query: { ...job('pending').query, identifier: 'slow_profile' }, key: 'slow-key' });
+    await s.w.eval('scReviewLoad()');
+    const send = s.w.chrome.runtime.sendMessage, submitted = []; let finishFirst;
+    s.w.chrome.runtime.sendMessage = msg => {
+      if (msg.action !== 'sc-submit') return send(msg);
+      submitted.push({ bidId: msg.bidId, job: msg.job });
+      if (msg.bidId === '42') return new Promise(resolve => { finishFirst = resolve; });
+      const entry = s.pack.entries.find(e => e.bidId === msg.bidId);
+      entry.jobs[msg.job].check = { ...job('found').check };
+      return Promise.resolve({ ok: true });
+    };
+    s.w.document.getElementById('check').click(); await settle();
+    assert.equal(typeof finishFirst, 'function');
+    s.pack.entries.push({ ...s.pack.entries[0], bidId: '43', extractionState: 'ready',
+      jobs: [{ query: { ...job('pending').query, identifier: 'newly_ready' }, key: 'ready-key' }] },
+    { ...s.pack.entries[0], bidId: '44', extractionState: 'pending', jobs: [] });
+    await s.intervals[0](); await settle();
+    assert.deepEqual(submitted, [{ bidId: '42', job: 1 }, { bidId: '43', job: 0 }]);
+    assert.equal(s.pack.entries[2].extractionState, 'pending');
+    await s.intervals[0](); await settle();
+    assert.equal(submitted.length, 2, 'No duplicate requests while the earlier job is still in flight');
+    finishFirst({ ok: true }); await settle();
+  } finally { s.dom.window.close(); }
+});
+test('row retry targets only that job, and accepted checks are refreshed rather than submitted again', async () => {
+  for (const accepted of [false, true]) {
+    const j = accepted ? job('pending') : { query: job('pending').query, key: 'stable-key', attempted: true };
+    Object.assign(j, { requestState: 'failed', requestAction: accepted ? 'sc-refresh' : 'sc-submit',
+      retryable: true, attemptCount: 11, error: 'Synthetic exhausted retries' });
+    const s = await review([j, job('found')]);
+    try {
+      s.w.document.querySelector('.pm-request-retry').click(); await settle();
+      const requests = s.messages.filter(m => ['sc-submit', 'sc-refresh'].includes(m.action));
+      assert.equal(requests.length, 1); assert.equal(requests[0].job, 0);
+      assert.equal(requests[0].action, accepted ? 'sc-refresh' : 'sc-submit');
+      assert.equal(requests[0].manual, true);
+    } finally { s.dom.window.close(); }
+  }
 });
 test('review renders horizontal rows, 0 vs null and unavailable without claiming absence', async () => {
   const s = await review([job('unavailable')]);
@@ -120,7 +259,7 @@ test('review dispatches the batch concurrently, reports errors and does not issu
     pending[0]({ ok: false, error: 'Synthetic pause' }); await settle();
     assert.equal(s.w.document.getElementById('check').disabled, true, 'Wait for already-sent jobs even after one fails');
     pending[1]({ ok: true }); await settle();
-    assert.match(s.w.document.getElementById('notice').textContent, /Очередь приостановлена/);
+    assert.match(s.w.document.getElementById('notice').textContent, /Часть запросов не завершилась/);
     assert.equal(s.w.document.getElementById('check').disabled, false);
   } finally { s.dom.window.close(); }
 });

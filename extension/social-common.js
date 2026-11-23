@@ -2,6 +2,7 @@
 
 // Pure helpers shared by the isolated content script, worker and review page.
 const PM_SOCIAL = (() => {
+  const retryLimit = 10, aiRetryLimit = 3, retryDelay = 2000, apiInterval = 200;
   const defaults = { Instagram: 'instagram', Twitter: 'x', X: 'x', 'x.com(Twitter)': 'x',
     TikTok: 'tiktok', YouTube: 'youtube', Reddit: 'reddit', Facebook: 'facebook' };
   const supported = { instagram: ['username'], facebook: ['username', 'id'], x: ['username'],
@@ -113,7 +114,28 @@ const PM_SOCIAL = (() => {
       return { index, identifier: result?.identifier || null, type: result?.type || null };
     });
   }
+  function legacyTransient(job) {
+    return /^(Сетевой сбой\.|API вернул некорректный JSON|Некорректный ответ проверки|Лимит API:|Биллинг временно недоступен|API: HTTP (408|425|429|5\d\d)\b)/.test(job.error || '');
+  }
+  function resumeAttempts(job, action) {
+    if (job.requestAction === action && ['queued', 'sending', 'retry_wait'].includes(job.requestState)) return job.attemptCount || 0;
+    if (!job.requestState && job.attempted && ((action === 'sc-submit' && !job.error) || legacyTransient(job))) return (job.retryCount || 0) + 1;
+    return 0;
+  }
+  function autoAction(job) {
+    const action = job.check?.id ? 'sc-refresh' : 'sc-submit';
+    if (action === 'sc-submit' && job.rejected) return null;
+    if (action === 'sc-refresh' && !['pending', 'running'].includes(job.check.status)) return null;
+    if (job.requestAction === action && ['failed', 'paused'].includes(job.requestState)) return null;
+    const resuming = job.requestAction === action && ['queued', 'sending', 'retry_wait'].includes(job.requestState);
+    if (resuming) return resumeAttempts(job, action) < retryLimit + 1 ? action : null;
+    if (job.error && !legacyTransient(job)) return null;
+    if (job.error && (job.retryCount || 0) >= retryLimit) return null;
+    if (resumeAttempts(job, action) >= retryLimit + 1) return null;
+    if (action === 'sc-submit' && job.attempted && job.requestState) return null;
+    return action;
+  }
   return { defaults, fields, statuses, normalize, valid, rows, sample, types, serverSuccess, manualColumn,
-    profileURL, resolve, splitColumns,
-    retryLimit: 10, retryDelay: 2000 };
+    profileURL, resolve, splitColumns, autoAction, resumeAttempts,
+    retryLimit, aiRetryLimit, retryDelay, apiInterval };
 })();

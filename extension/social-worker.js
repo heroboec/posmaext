@@ -3,6 +3,9 @@
 const scDefaultConfig = { url: 'https://216.57.104.188/', key: '', interval: 800, mapping: PM_SOCIAL.defaults };
 let scSerial = Promise.resolve();
 let scLimitSerial = Promise.resolve();
+let scStartSerial = Promise.resolve();
+let scNextStart = 0;
+const scBootTime = Date.now();
 const scInFlight = new Map();
 function scExclusive(fn) {
   const task = scSerial.then(fn);
@@ -49,42 +52,67 @@ function scRecovered() {
   scLimitSerial = task.catch(() => {});
   return task;
 }
-async function scApi(path, { method = 'GET', query, key, owner, binding, preflight, diagnostic } = {}) {
-  // No normal request spacing. Only a server/network cooldown delays new starts.
-  for (;;) {
-    await scLimitSerial;
-    const limit = await PM_DB.get('api-limit') || { next: 0 };
-    await scSleep(Math.max(0, limit.next - Date.now()));
-    await scLimitSerial;
-    if ((await PM_DB.get('api-limit'))?.next > Date.now()) continue;
-    break;
-  }
-  scAssertLive(owner);
-  const config = await scConfig();
-  if (binding && binding !== await scBinding(config)) throw new Error('URL или ключ магазина изменились. Для этого пакета API заблокирован');
-  if (!config.key) throw new Error('Укажите API-ключ в настройках');
-  if (!await chrome.permissions.contains({ origins: [new URL(config.url).origin + '/*'] })) {
-    throw new Error('Нет разрешения на доступ к серверу. Сохраните настройки Social Check');
-  }
-  await preflight?.();
-  scAssertLive(owner);
-  let response, trace;
-  if (diagnostic) {
-    PM_DIAG.addSecrets([config.key]);
-    trace = PM_DIAG.start({ ...diagnostic, kind: 'social', method, endpoint: new URL('api/v1/' + path, config.url).href,
-      queryKey: PM_DIAG.queryKey(diagnostic.query) });
-    diagnostic.traceId = trace;
-  }
+async function scApi(path, { method = 'GET', query, key, owner, binding, preflight, diagnostic, onStart } = {}) {
+  // One FIFO admission queue for POST, GET, catalog calls and retries across tabs.
+  // Release the slot after starting fetch(), never after receiving its response.
+  const start = scStartSerial.then(async () => {
+    let config;
+    for (;;) {
+      await scLimitSerial;
+      const limit = await PM_DB.get('api-limit'), rate = await PM_DB.get('api-rate');
+      const next = Math.max(limit?.next || 0, rate?.next || 0, scNextStart,
+        rate ? scBootTime + PM_SOCIAL.apiInterval : 0);
+      if (next > Date.now()) await scSleep(next - Date.now());
+      scAssertLive(owner);
+      if (next > Date.now()) continue;
+      await scLimitSerial;
+      if ((await PM_DB.get('api-limit'))?.next > Date.now()) continue;
+      scAssertLive(owner);
+      config = await scConfig();
+      if (binding && binding !== await scBinding(config)) throw new Error('URL или ключ магазина изменились. Для этого пакета API заблокирован');
+      if (!config.key) throw new Error('Укажите API-ключ в настройках');
+      if (!await chrome.permissions.contains({ origins: [new URL(config.url).origin + '/*'] })) throw new Error('Нет разрешения на доступ к серверу. Сохраните настройки Social Check');
+      await preflight?.();
+      await scLimitSerial;
+      if ((await PM_DB.get('api-limit'))?.next > Date.now()) continue;
+      break;
+    }
+    scAssertLive(owner);
+    await onStart?.();
+    // Persist a reservation before dispatch; keep actual starts at least 200 ms apart.
+    await PM_DB.set('api-rate', { next: Date.now() + PM_SOCIAL.apiInterval });
+    scAssertLive(owner);
+    let trace;
+    if (diagnostic) {
+      PM_DIAG.addSecrets([config.key]);
+      trace = PM_DIAG.start({ ...diagnostic, kind: 'social', method, endpoint: new URL('api/v1/' + path, config.url).href,
+        queryKey: PM_DIAG.queryKey(diagnostic.query) });
+      diagnostic.traceId = trace;
+    }
+    let outcome;
+    try {
+      outcome = Promise.resolve(fetch(new URL('api/v1/' + path, config.url).href, {
+        method, credentials: 'omit', redirect: 'error', cache: 'no-store',
+        headers: { Authorization: 'Bearer ' + config.key, ...(query ? { 'Content-Type': 'application/json', 'Idempotency-Key': key } : {}) },
+        ...(query ? { body: JSON.stringify(query) } : {}), signal: AbortSignal.timeout(30000),
+      })).then(response => ({ response }), error => ({ error }));
+    } catch (error) { outcome = Promise.resolve({ error }); }
+    scNextStart = Date.now() + PM_SOCIAL.apiInterval;
+    await PM_DB.set('api-rate', { next: scNextStart });
+    return { outcome, trace };
+  });
+  scStartSerial = start.then(() => {}, () => {});
+  const { outcome, trace } = await start;
+  let response;
   try {
-    response = await fetch(new URL('api/v1/' + path, config.url).href, {
-      method, credentials: 'omit', redirect: 'error', cache: 'no-store',
-      headers: { Authorization: 'Bearer ' + config.key, ...(query ? { 'Content-Type': 'application/json', 'Idempotency-Key': key } : {}) },
-      ...(query ? { body: JSON.stringify(query) } : {}), signal: AbortSignal.timeout(30000),
-    });
+    const result = await outcome;
+    if (result.error) throw result.error;
+    response = result.response;
   } catch (err) {
     PM_DIAG.error(trace, err);
     await scBackoff();
-    throw Object.assign(new Error('Сетевой сбой. Результат отправки неизвестен; повтор использует прежний ключ'), { retryable: true });
+    throw Object.assign(new Error('Нет ответа от Social Check: сеть, TLS, CORS или таймаут; повтор использует прежний ключ'), {
+      retryable: true, errorKind: err?.name === 'TimeoutError' ? 'timeout' : 'network' });
   }
   const captured = diagnostic ? await PM_DIAG.capture(response, trace) : null;
   if ([408, 425, 429].includes(response.status) || response.status >= 500) {
@@ -106,7 +134,8 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
   try { json = captured ? captured.json() : await response.json(); } catch (err) {
     PM_DIAG.error(trace, err);
     await scBackoff();
-    throw Object.assign(new Error('API вернул некорректный JSON; повтор использует прежний ключ'), { retryable: true });
+    throw Object.assign(new Error('API вернул некорректный JSON; повтор использует прежний ключ'), {
+      retryable: true, errorKind: err?.name === 'TimeoutError' ? 'timeout' : 'invalid_response', httpStatus: response.status });
   }
   return json;
 }
@@ -181,10 +210,18 @@ async function scHandle(msg, sender) {
   }
   if (msg.action === 'sc-test') {
     if (!scPage(sender, 'options.html')) throw new Error('Доступ запрещён');
-    const result = await scApi('platforms');
-    if (!Array.isArray(result.platforms)) throw new Error('Неверный ответ каталога API');
-    await PM_DB.set('catalog', result.platforms);
-    return { catalog: result.platforms };
+    const binding = await scBinding(await scConfig());
+    // Network admission may need scExclusive for another job's onStart progress.
+    // Never hold the state lock while waiting in the shared HTTP queue.
+    return async () => {
+      const result = await scApi('platforms', { binding });
+      if (!Array.isArray(result.platforms)) throw new Error('Неверный ответ каталога API');
+      return scExclusive(async () => {
+        if (binding !== await scBinding(await scConfig())) throw new Error('Настройки Social Check изменились во время проверки связи');
+        await PM_DB.set('catalog', result.platforms);
+        return { catalog: result.platforms };
+      });
+    };
   }
   if (msg.action === 'sc-create') {
     if (!sender.tab || sender.frameId !== 0 || !sender.url || !/^https?:/.test(sender.url)) throw new Error('Нужна исходная страница списка');
@@ -215,7 +252,24 @@ async function scHandle(msg, sender) {
     return { packages: packs.filter(Boolean).map(p => ({ id: p.id, created: p.created, count: p.entries.length })) };
   }
   const pack = await scPackage(msg.id);
-  if (msg.action === 'sc-get') return { package: pack, sameStore: pack.binding === await scBinding(await scConfig()) };
+  if (msg.action === 'sc-get') {
+    let changed = false;
+    for (const entry of pack.entries) for (let i = 0; i < entry.jobs.length; i++) {
+      const job = entry.jobs[i];
+      if (!['queued', 'sending', 'retry_wait'].includes(job.requestState) || scInFlight.has(JSON.stringify([pack.id, entry.bidId, i]))) continue;
+      if (job.attemptCount >= PM_SOCIAL.retryLimit + 1) {
+        job.requestState = 'failed'; job.retryable = true;
+        job.error = 'Лимит попыток исчерпан; ответ последней попытки не сохранился. Можно продолжить вручную с тем же ключом';
+      } else if (job.requestState === 'sending') {
+        job.requestState = 'retry_wait';
+        job.retryAt = Date.now() + PM_SOCIAL.retryDelay;
+        job.error = 'Фоновая обработка прервалась; восстанавливаю ответ с прежним ключом';
+      } else continue;
+      changed = true;
+    }
+    if (changed) await scSave(pack);
+    return { package: pack, sameStore: pack.binding === await scBinding(await scConfig()) };
+  }
   if (msg.action === 'sc-diagnostics') {
     if (!scPage(sender, 'review.html')) throw new Error('Откройте страницу результатов');
     const target = pack.entries.find(e => e.bidId === msg.bidId);
@@ -284,20 +338,46 @@ async function scHandle(msg, sender) {
   if (msg.action === 'sc-submit' && job.check?.id) return {};
   if (msg.action === 'sc-submit' && job.rejected) throw new Error('Запрос отклонён API. Автоматический новый платный запрос запрещён');
   if (msg.action === 'sc-refresh' && !job.check?.id) return {};
+  if (msg.manual === false && PM_SOCIAL.autoAction(job) !== msg.action) return {};
+  const used = msg.manual === false ? PM_SOCIAL.resumeAttempts(job, msg.action) : 0;
+  const retryAt = used ? job.retryAt || Date.now() + PM_SOCIAL.retryDelay : 0;
   // Keys and exact query already durably stored at package creation, before any POST.
-  job.error = null; job.retryCount = 0; job.attempted = true; await scSave(pack);
-  const running = scRunCheck(msg, pack, entry, job, owner);
+  job.error = null; job.retryCount = Math.max(0, used - 1); job.attempted = true;
+  job.requestAction = msg.action; job.requestState = used ? 'retry_wait' : 'queued';
+  job.attemptCount = used; job.retryAt = retryAt; job.errorKind = null; job.lastHttpStatus = null;
+  await scSave(pack);
+  const running = scRunCheck(msg, pack, entry, job, owner, used);
   scInFlight.set(slot, running);
   running.then(() => scInFlight.delete(slot), () => scInFlight.delete(slot));
   return () => running;
 }
-async function scRunCheck(msg, pack, entry, job, owner) {
+async function scJobProgress(msg, pack, job) {
+  await scExclusive(async () => {
+    const latest = await scPackage(pack.id);
+    const target = latest.entries.find(e => e.bidId === msg.bidId)?.jobs[msg.job];
+    if (!target || target.key !== job.key) throw new Error('Проверка в пакете изменилась');
+    for (const field of ['error', 'retryCount', 'requestAction', 'requestState', 'attemptCount',
+      'retryAt', 'lastAttemptAt', 'errorKind', 'lastHttpStatus', 'retryable']) target[field] = job[field] ?? null;
+    if (job.check) target.check = job.check;
+    if (job.rejected) target.rejected = true;
+    await scSave(latest);
+  });
+}
+async function scRunCheck(msg, pack, entry, job, owner, used = 0) {
   let error;
-  for (let attempt = 0; attempt <= PM_SOCIAL.retryLimit; attempt++) {
+  for (let attempt = used; attempt <= PM_SOCIAL.retryLimit; attempt++) {
     let diagnostic;
     try {
+      if (job.retryAt > Date.now()) await scSleep(job.retryAt - Date.now());
+      scAssertLive(owner);
+      job.requestState = 'queued'; job.retryAt = 0;
+      await scJobProgress(msg, pack, job);
       diagnostic = { packId: pack.id, bidId: entry.bidId, query: job.query, attempt: attempt + 1 };
-      const request = { owner, binding: pack.binding, diagnostic, preflight: async () => {
+      const request = { owner, binding: pack.binding, diagnostic, onStart: async () => {
+        job.requestState = 'sending'; job.attemptCount = attempt + 1; job.retryCount = attempt;
+        job.lastAttemptAt = Date.now();
+        await scJobProgress(msg, pack, job);
+      }, preflight: async () => {
         const latest = await scPackage(pack.id);
         if (latest.entries.find(e => e.bidId === entry.bidId)?.jobs[msg.job]?.key !== job.key) throw new Error('Проверка в пакете изменилась');
         if (latest.auto && msg.action === 'sc-submit') {
@@ -313,34 +393,33 @@ async function scRunCheck(msg, pack, entry, job, owner) {
           !check.query || check.query.platform !== job.query.platform || check.query.identifier_type !== job.query.identifier_type ||
           typeof check.query.identifier !== 'string' ||
           PM_SOCIAL.normalize(job.query.identifier_type, check.query.identifier) !== PM_SOCIAL.normalize(job.query.identifier_type, job.query.identifier) ||
-          (job.check?.id && job.check.id !== check.id)) throw Object.assign(new Error('Некорректный ответ проверки; повтор использует прежний ключ'), { retryable: true });
-      job.check = check; job.error = null; error = null; break;
+           (job.check?.id && job.check.id !== check.id)) throw Object.assign(new Error('Некорректный ответ проверки; повтор использует прежний ключ'), { retryable: true, errorKind: 'invalid_response' });
+      job.check = check; job.error = null; job.requestState = 'confirmed'; job.retryable = false;
+      job.errorKind = null; job.lastHttpStatus = null; job.retryAt = 0; error = null; break;
     } catch (e) {
       PM_DIAG.error(diagnostic?.traceId, e);
       job.error = e.message;
+      job.retryable = !!e.retryable; job.lastHttpStatus = e.httpStatus || null;
+      job.errorKind = e.errorKind || (e.httpStatus === 408 ? 'timeout' : e.httpStatus >= 500 ? 'server' : e.httpStatus === 429 ? 'rate_limit' :
+        [401, 403].includes(e.httpStatus) ? 'auth' : e.httpStatus === 402 ? 'balance' : e.httpStatus ? 'api' : 'local');
       if ([400, 409].includes(e.httpStatus)) job.rejected = true;
       error = e;
+      job.requestState = !e.retryable && !e.httpStatus ? 'paused' : 'failed';
       if (!e.retryable || attempt === PM_SOCIAL.retryLimit) break;
       try {
         scAssertLive(owner);
-        await scSleep(PM_SOCIAL.retryDelay);
+        job.requestState = 'retry_wait';
+        job.retryAt = Math.max(Date.now() + PM_SOCIAL.retryDelay, (await PM_DB.get('api-limit'))?.next || 0);
+        await scJobProgress(msg, pack, job);
+        await scSleep(Math.max(0, job.retryAt - Date.now()));
         scAssertLive(owner);
-        job.retryCount = attempt + 1;
-      } catch (cancel) { job.error = cancel.message; error = cancel; break; }
+      } catch (cancel) {
+        job.error = cancel.message; job.errorKind = 'local'; job.requestState = 'paused'; job.retryable = false;
+        error = cancel; break;
+      }
     }
   }
-  await scExclusive(async () => {
-    // Other requests, DOM sync and manual decisions may have changed this package.
-    // Never overwrite it with the snapshot captured before the network request.
-    const latest = await scPackage(pack.id);
-    const target = latest.entries.find(e => e.bidId === entry.bidId)?.jobs[msg.job];
-    if (!target || target.key !== job.key) throw new Error('Проверка в пакете изменилась');
-    target.error = job.error;
-    target.retryCount = job.retryCount || 0;
-    if (job.check) target.check = job.check;
-    if (job.rejected) target.rejected = true;
-    await scSave(latest);
-  });
+  await scJobProgress(msg, pack, job);
   if (error) throw error;
   return {};
 }

@@ -111,11 +111,11 @@ function aiParse(json, rows, platform, types) {
   }
   return { jobs, issues, resolved, identities };
 }
-async function aiRequest(config, entry, rows, types, signal, preflight, diagnostic) {
+async function aiRequest(config, entry, rows, types, signal, preflight, diagnostic, onResolved) {
   const resolved = new Set(), jobs = new Map();
   const collected = () => ({ jobs: [...jobs.values()], resolved: [...resolved],
     issues: rows.flatMap((_, i) => resolved.has(i) ? [] : [`Строка ${i + 1}: логин не определён`]) });
-  for (let attempt = 0; attempt <= PM_SOCIAL.retryLimit; attempt++) {
+  for (let attempt = 0; attempt <= PM_SOCIAL.aiRetryLimit; attempt++) {
     signal.throwIfAborted();
     if (JSON.stringify(await aiConfig()) !== JSON.stringify(config)) throw new Error('Настройки ИИ изменились. Запустите подготовку заново');
     await aiPermission(config);
@@ -149,6 +149,7 @@ async function aiRequest(config, entry, rows, types, signal, preflight, diagnost
           response.status === 404 ? 'ИИ: адрес или модель не найдены' : `ИИ: HTTP ${response.status}`);
       }
       const result = aiParse(captured.json(), pending.map(i => rows[i]), entry.platform, types);
+      const before = resolved.size;
       for (const identity of result.identities) {
         const sourceIndex = pending[identity.index];
         if (resolved.has(sourceIndex)) continue;
@@ -159,8 +160,10 @@ async function aiRequest(config, entry, rows, types, signal, preflight, diagnost
         PM_DIAG.link(diagnostic.packId, entry.bidId, diagnostic.contextId, diagnostic.indexes[sourceIndex],
           { platform: entry.platform, identifier_type: identity.type, identifier: identity.identifier });
       }
+      // Publish good identifiers before retrying nulls in this very same chunk.
+      if (resolved.size > before) await onResolved?.(collected());
       if (resolved.size === rows.length) return collected();
-      if (attempt === PM_SOCIAL.retryLimit) {
+      if (attempt === PM_SOCIAL.aiRetryLimit) {
         PM_DIAG.error(trace, new Error('ИИ не определил все логины')); return collected();
       }
       // A valid JSON answer with null logins is also a failed extraction, not success.
@@ -168,10 +171,10 @@ async function aiRequest(config, entry, rows, types, signal, preflight, diagnost
     } catch (error) {
       PM_DIAG.error(trace, error);
       signal.throwIfAborted();
-      if (terminal || attempt === PM_SOCIAL.retryLimit) {
+      if (terminal || attempt === PM_SOCIAL.aiRetryLimit) {
         if (jobs.size) return collected();
         throw new Error(terminal ? error.message :
-          `Не удалось определить логины: ИИ недоступен или вернул некорректный ответ (${PM_SOCIAL.retryLimit + 1} попыток)`);
+          `Не удалось определить логины: ИИ недоступен или вернул некорректный ответ (${PM_SOCIAL.aiRetryLimit + 1} попытки)`);
       }
       await aiDelay(Math.max(retry, PM_SOCIAL.retryDelay), signal);
     }
@@ -275,20 +278,23 @@ async function aiExtract(msg, sender) {
           let release;
           try {
             release = await aiSlot(config, signal);
+            const persist = async (result, final = false) => {
+              await preflight();
+              await scExclusive(async () => {
+                const latest = await scPackage(pack.id), target = latest.entries.find(e => e.bidId === entry.bidId);
+                if (signal.aborted || latest.runId !== run.runId || latest.aiPaused || target.status !== entry.status ||
+                    latest.binding !== await scBinding(await scConfig())) throw new Error('Подготовка отменена или статус изменился');
+                for (const job of result.jobs) {
+                  if (!target.jobs.some(j => j.query.identifier_type === job.query.identifier_type && j.query.identifier === job.query.identifier)) target.jobs.push(job);
+                }
+                target.extractedIndexes = [...new Set([...(target.extractedIndexes || []), ...result.resolved.map(i => indexes[i])])];
+                if (final) target.extractionIssues.push(...result.issues.map(issue => issue.replace(/^Строка (\d+):/, (_, n) => `Строка ${indexes[Number(n) - 1] + 1}:`)));
+                await scSave(latest);
+              });
+            };
             const result = await aiRequest(config, entry, indexes.map(i => rows[i]), PM_SOCIAL.types(await PM_DB.get('catalog'), entry.platform),
-              signal, preflight, { packId: pack.id, contextId, indexes });
-            await preflight();
-            await scExclusive(async () => {
-              const latest = await scPackage(pack.id), target = latest.entries.find(e => e.bidId === entry.bidId);
-              if (signal.aborted || latest.runId !== run.runId || latest.aiPaused || target.status !== entry.status ||
-                  latest.binding !== await scBinding(await scConfig())) throw new Error('Подготовка отменена или статус изменился');
-              for (const job of result.jobs) {
-                if (!target.jobs.some(j => j.query.identifier_type === job.query.identifier_type && j.query.identifier === job.query.identifier)) target.jobs.push(job);
-              }
-              target.extractedIndexes = [...new Set([...(target.extractedIndexes || []), ...result.resolved.map(i => indexes[i])])];
-              target.extractionIssues.push(...result.issues.map(issue => issue.replace(/^Строка (\d+):/, (_, n) => `Строка ${indexes[Number(n) - 1] + 1}:`)));
-              await scSave(latest);
-            });
+              signal, preflight, { packId: pack.id, contextId, indexes }, result => persist(result));
+            await persist(result, true);
           } catch (error) { failures.push(error.message); }
           finally { release?.(); }
         }

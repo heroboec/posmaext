@@ -10,10 +10,12 @@ const catalog = [{ platform: 'instagram', object_type: 'profile', operation: 'fe
 const settle = async () => { for (let i = 0; i < 15; i++) await new Promise(r => setImmediate(r)); };
 function setup() {
   const listeners = [], requests = [], waits = [];
+  let clock = Date.now();
   let connectListener;
   const ctx = vm.createContext({
     indexedDB: new IDBFactory(), crypto: webcrypto, TextEncoder, URL, AbortController, AbortSignal, DOMException,
-    Date, Headers, setTimeout: (fn, ms) => { waits.push(ms); queueMicrotask(fn); }, clearTimeout() {},
+    Date: class extends Date { static now() { return clock; } }, Headers,
+    setTimeout: (fn, ms) => { waits.push(ms); clock += ms || 0; queueMicrotask(fn); }, clearTimeout() {},
     chrome: { runtime: { getURL: p => 'chrome-extension://test/' + p,
       onMessage: { addListener: fn => listeners.push(fn) }, onConnect: { addListener: fn => { connectListener = fn; } } },
       permissions: { contains: async () => true }, tabs: { create: async () => ({}), get: async () => ({ url: source.url }),
@@ -109,14 +111,14 @@ test('AI: uses full row with title and fallback format; persists only verified l
   assert.equal(w.requests.length, 1, 'already extracted identifiers are not re-extracted');
 });
 
-test('AI: malformed identifier gets ten retries two seconds apart without echoing secrets', async () => {
+test('AI: malformed identifier gets three retries two seconds apart without echoing secrets', async () => {
   const w = setup(); await w.configure(); const run = await w.create(); let attempts = 0;
   w.ctx.fetch = async () => { attempts++; return { ok: true, status: 200, headers: new Headers(), json: async () => ({
     choices: [{ message: { content: '{"accounts":[{"index":0,"type":"username","identifier":"invented_user"}]}' } }],
   }) }; };
   const result = await w.extract(run);
-  assert.equal(result.ok, false); assert.equal(attempts, 11);
-  assert.deepEqual(w.waits, Array(10).fill(2000));
+  assert.equal(result.ok, false); assert.equal(attempts, 4);
+  assert.deepEqual(w.waits, Array(3).fill(2000));
   const pack = await w.ctx.db.get('package:' + run.id);
   assert.equal(pack.entries[0].jobs.length, 0);
   assert.doesNotMatch(pack.entries[0].extractionError, /invented_user|SYNTHETIC_PASSWORD/);
@@ -127,7 +129,7 @@ test('AI: retries 429 with Retry-After but not invalid credentials', async () =>
     const w = setup(); await w.configure(); const run = await w.create(); let attempts = 0;
     w.ctx.fetch = async () => { attempts++; return { ok: false, status, headers: new Headers({ 'Retry-After': '4' }) }; };
     assert.equal((await w.extract(run)).ok, false);
-    assert.equal(attempts, status === 429 ? 11 : 1);
+    assert.equal(attempts, status === 429 ? 4 : 1);
     if (status === 429) assert.ok(w.waits.includes(4000));
   }
 });
@@ -293,6 +295,40 @@ test('pipeline: a ready bid can reach Social Check before the other bid finishes
   const pack = await w.ctx.db.get('package:' + run.id);
   assert.equal(pack.entries[1].extractionState, 'pending');
   await w.send({ action: 'ai-cancel', id: run.id, runId: run.runId }); release(); await other;
+});
+test('pipeline: a resolved login reaches Social Check while another row in the SAME AI chunk is still retrying', async () => {
+  const w = setup(); await w.configure(); const run = await w.create();
+  let modelCalls = 0, release, input;
+  w.ctx.fetch = async (url, init) => {
+    if (!url.includes('chat/completions')) return { ok: true, status: 200, headers: new Headers(),
+      json: async () => ({ id: 'synthetic-early-check', status: 'found', query: JSON.parse(init.body) }) };
+    modelCalls++;
+    input = JSON.parse(JSON.parse(init.body).messages[1].content).rows;
+    if (modelCalls === 1) return { ok: true, status: 200, headers: new Headers(), json: async () => ({
+      choices: [{ message: { content: JSON.stringify({ accounts: [
+        { index: 0, type: 'username', identifier: 'test_user' }, { index: 1, type: 'username', identifier: null },
+      ] }) } }],
+    }) };
+    return new Promise(resolve => { release = () => resolve({ ok: true, status: 200, headers: new Headers(),
+      json: async () => ({ choices: [{ message: { content: JSON.stringify({
+        accounts: [{ index: 0, type: 'username', identifier: 'second_user' }],
+      }) } }] }) }); });
+  };
+  const extracting = w.extract(run, '42', ['test_user:SYNTHETIC_PASSWORD', 'second_user:SYNTHETIC_PASSWORD']);
+  for (let i = 0; i < 100 && !release; i++) await settle();
+  assert.equal(typeof release, 'function');
+  const partial = (await w.ctx.db.get('package:' + run.id)).entries[0];
+  assert.equal(partial.extractionState, 'pending');
+  assert.equal(partial.jobs.length, 1); assert.equal(partial.jobs[0].query.identifier, 'test_user');
+  assert.deepEqual(Array.from(input, row => row.value), ['second_user:SYNTHETIC_PASSWORD']);
+  w.connect(run.id);
+  const checked = await w.send({ action: 'sc-submit', id: run.id, bidId: '42', job: 0, client: 'client', manual: false }, reviewPage);
+  assert.equal(checked.ok, true, checked.error);
+  assert.equal((await w.ctx.db.get('package:' + run.id)).entries[0].jobs[0].check.id, 'synthetic-early-check');
+  release(); assert.equal((await extracting).ok, true);
+  const done = (await w.ctx.db.get('package:' + run.id)).entries[0];
+  assert.equal(done.jobs.length, 2); assert.equal(done.jobs[0].key, partial.jobs[0].key);
+  assert.equal(done.jobs[0].check.id, 'synthetic-early-check');
 });
 
 test('AI: an email local-part or domain cannot be substituted for a social login', async () => {
