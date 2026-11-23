@@ -1,7 +1,7 @@
 'use strict';
 
 let scReviewId = new URLSearchParams(location.search).get('id');
-let scReviewPack, scReviewSameStore = false, scReviewBusy = false, scReviewStop = false, scReviewClosed = false, scReviewPort;
+let scReviewPack, scReviewApiQueue, scReviewSameStore = false, scReviewBusy = false, scReviewStop = false, scReviewClosed = false, scReviewPort;
 const scReviewClient = crypto.randomUUID();
 const scReviewJobRequests = new Map();
 const scNode = (tag, text, parent) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; parent?.append(node); return node; };
@@ -9,7 +9,7 @@ const scNotice = text => { document.getElementById('notice').textContent = text;
 const scValue = value => value === null || value === undefined ? 'Нет данных' : String(value);
 function scRequestStatus(job) {
   const read = job.requestAction === 'sc-refresh', attempts = PM_SOCIAL.retryLimit + 1;
-  if (job.requestState === 'queued') return read ? 'В очереди получения результата' : 'В очереди отправки · лимит 5 запросов/с';
+  if (job.requestState === 'queued') return `${read ? 'В очереди получения результата' : 'В очереди отправки'} · общий лимит 3 запроса/с`;
   if (job.requestState === 'retry_wait') return `${read ? 'Повтор получения результата' : 'Повтор отправки'} через ${Math.max(0, Math.ceil((job.retryAt - Date.now()) / 1000))} с · попытка ${Math.min(attempts, (job.attemptCount || 0) + 1)}/${attempts}`;
   if (job.requestState === 'sending') return `${read ? 'Получение результата' : 'Ожидание ответа на отправку'} · попытка ${Math.max(1, job.attemptCount || 0)}/${attempts}`;
   if (job.requestState === 'failed') return job.retryable ? `${read ? 'Результат не получен' : 'Отправка не подтверждена'} — попытки исчерпаны` : 'Запрос остановлен — требуется исправить причину';
@@ -54,12 +54,16 @@ window.addEventListener('pagehide', () => {
 });
 async function scReviewLoad() {
   const result = await scReviewMessage({ action: 'sc-get' });
-  scReviewPack = result.package; scReviewSameStore = result.sameStore; scReviewRender();
+  scReviewPack = result.package; scReviewApiQueue = result.apiQueue; scReviewSameStore = result.sameStore; scReviewRender();
 }
 function scReviewRender() {
   document.getElementById('controls').hidden = false;
   document.getElementById('summary').textContent = `Пакет ${scReviewPack.id} · заявок: ${scReviewPack.entries.length} · вкладка админки: ${scReviewPack.tabId}` +
     (scReviewSameStore ? '' : ' · URL/ключ магазина изменились — запросы API заблокированы');
+  if (scReviewApiQueue?.resumeAt > Date.now() + 1000) {
+    document.getElementById('summary').textContent += ` · ${scReviewApiQueue.reason === 'rate_limit' ? 'HTTP 429: пауза сервера' :
+      scReviewApiQueue.reason === 'temporary' ? 'Пауза после временной ошибки' : 'Ожидание лимита API'}: ещё ${Math.ceil((scReviewApiQueue.resumeAt - Date.now()) / 1000)} с; продолжение автоматическое`;
+  }
   for (const id of ['check', 'refresh', 'sync', 'reconnect', 'delete']) document.getElementById(id).disabled = scReviewBusy || (['check', 'refresh'].includes(id) && !scReviewSameStore);
   document.getElementById('stop').disabled = !scReviewBusy;
   document.getElementById('retry-ai').hidden = !scReviewPack.auto;

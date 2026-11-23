@@ -33,15 +33,26 @@ async function scSave(pack) { await PM_DB.set('package:' + pack.id, pack); }
 function scAssertLive(id) {
   if (id && !scLive.get(id)?.size) throw new Error('Очередь приостановлена: страница результатов закрыта');
 }
-function scBackoff(retry = 0) {
+function scBackoff(retry = 0, reason = 'temporary') {
   const task = scLimitSerial.then(async () => {
     const limit = await PM_DB.get('api-limit') || { next: 0, failures: 0 };
     limit.failures++;
     limit.next = Math.max(limit.next, Date.now() + Math.max(retry, PM_SOCIAL.retryDelay));
+    limit.reason = reason;
     await PM_DB.set('api-limit', limit);
   });
   scLimitSerial = task.catch(() => {});
   return task;
+}
+function scRateStarts(rate) {
+  return (Array.isArray(rate?.starts) ? rate.starts : [])
+    .filter(at => Number.isFinite(at) && at > Date.now() - PM_SOCIAL.apiMinuteWindow);
+}
+function scRateNext(rate) {
+  const starts = scRateStarts(rate);
+  return Math.max(rate?.next || 0, scNextStart,
+    starts.length >= PM_SOCIAL.apiMinuteLimit ? starts[starts.length - PM_SOCIAL.apiMinuteLimit] + PM_SOCIAL.apiMinuteWindow : 0,
+    rate ? scBootTime + PM_SOCIAL.apiInterval : 0);
 }
 function scRecovered() {
   const task = scLimitSerial.then(async () => {
@@ -60,8 +71,7 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
     for (;;) {
       await scLimitSerial;
       const limit = await PM_DB.get('api-limit'), rate = await PM_DB.get('api-rate');
-      const next = Math.max(limit?.next || 0, rate?.next || 0, scNextStart,
-        rate ? scBootTime + PM_SOCIAL.apiInterval : 0);
+      const next = Math.max(limit?.next || 0, scRateNext(rate));
       if (next > Date.now()) await scSleep(next - Date.now());
       scAssertLive(owner);
       if (next > Date.now()) continue;
@@ -79,8 +89,10 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
     }
     scAssertLive(owner);
     await onStart?.();
-    // Persist a reservation before dispatch; keep actual starts at least 200 ms apart.
-    await PM_DB.set('api-rate', { next: Date.now() + PM_SOCIAL.apiInterval });
+    // Reserve durably before dispatch, including failed/uncertain requests. No secrets.
+    const starts = scRateStarts(await PM_DB.get('api-rate'));
+    starts.push(Date.now());
+    await PM_DB.set('api-rate', { next: Date.now() + PM_SOCIAL.apiInterval, starts });
     scAssertLive(owner);
     let trace;
     if (diagnostic) {
@@ -98,7 +110,9 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
       })).then(response => ({ response }), error => ({ error }));
     } catch (error) { outcome = Promise.resolve({ error }); }
     scNextStart = Date.now() + PM_SOCIAL.apiInterval;
-    await PM_DB.set('api-rate', { next: scNextStart });
+    // Use actual dispatch time for the rolling minute, not the preflight start.
+    starts[starts.length - 1] = Date.now();
+    await PM_DB.set('api-rate', { next: scNextStart, starts });
     return { outcome, trace };
   });
   scStartSerial = start.then(() => {}, () => {});
@@ -114,12 +128,14 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
     throw Object.assign(new Error('Нет ответа от Social Check: сеть, TLS, CORS или таймаут; повтор использует прежний ключ'), {
       retryable: true, errorKind: err?.name === 'TimeoutError' ? 'timeout' : 'network' });
   }
-  const captured = diagnostic ? await PM_DIAG.capture(response, trace) : null;
+  // Publish cooldown as soon as headers arrive, before reading diagnostic bodies.
   if ([408, 425, 429].includes(response.status) || response.status >= 500) {
     const header = response.headers.get('Retry-After');
     const retry = header && /^\d+(\.\d+)?$/.test(header) ? Number(header) * 1000 : Math.max(0, Date.parse(header) - Date.now()) || 0;
-    await scBackoff(retry);
+    await scBackoff(retry || (response.status === 429 ? PM_SOCIAL.apiMinuteWindow : 0),
+      response.status === 429 ? 'rate_limit' : 'temporary');
   }
+  const captured = diagnostic ? await PM_DIAG.capture(response, trace) : null;
   if (!response.ok) {
     const messages = { 400: 'API отклонил параметры', 401: 'Неверный API-ключ', 402: 'Недостаточно средств',
       403: 'Доступ запрещён', 409: 'Конфликт ключа идемпотентности', 429: 'Лимит API: повторите позднее', 503: 'Биллинг временно недоступен' };
@@ -268,7 +284,11 @@ async function scHandle(msg, sender) {
       changed = true;
     }
     if (changed) await scSave(pack);
-    return { package: pack, sameStore: pack.binding === await scBinding(await scConfig()) };
+    const limit = await PM_DB.get('api-limit'), rate = await PM_DB.get('api-rate');
+    return { package: pack, sameStore: pack.binding === await scBinding(await scConfig()),
+      apiQueue: { resumeAt: Math.max(limit?.next || 0, scRateNext(rate)),
+        reason: limit?.next > Date.now() ? limit.reason || 'temporary' : 'rate',
+        active: scInFlight.size } };
   }
   if (msg.action === 'sc-diagnostics') {
     if (!scPage(sender, 'review.html')) throw new Error('Откройте страницу результатов');
@@ -357,7 +377,7 @@ async function scJobProgress(msg, pack, job) {
     const target = latest.entries.find(e => e.bidId === msg.bidId)?.jobs[msg.job];
     if (!target || target.key !== job.key) throw new Error('Проверка в пакете изменилась');
     for (const field of ['error', 'retryCount', 'requestAction', 'requestState', 'attemptCount',
-      'retryAt', 'lastAttemptAt', 'errorKind', 'lastHttpStatus', 'retryable']) target[field] = job[field] ?? null;
+      'retryAt', 'lastAttemptAt', 'errorKind', 'lastHttpStatus', 'retryable', 'nextPollAt']) target[field] = job[field] ?? null;
     if (job.check) target.check = job.check;
     if (job.rejected) target.rejected = true;
     await scSave(latest);
@@ -395,6 +415,7 @@ async function scRunCheck(msg, pack, entry, job, owner, used = 0) {
           PM_SOCIAL.normalize(job.query.identifier_type, check.query.identifier) !== PM_SOCIAL.normalize(job.query.identifier_type, job.query.identifier) ||
            (job.check?.id && job.check.id !== check.id)) throw Object.assign(new Error('Некорректный ответ проверки; повтор использует прежний ключ'), { retryable: true, errorKind: 'invalid_response' });
       job.check = check; job.error = null; job.requestState = 'confirmed'; job.retryable = false;
+      job.nextPollAt = ['pending', 'running'].includes(check.status) ? Date.now() + PM_SOCIAL.pollInterval : 0;
       job.errorKind = null; job.lastHttpStatus = null; job.retryAt = 0; error = null; break;
     } catch (e) {
       PM_DIAG.error(diagnostic?.traceId, e);

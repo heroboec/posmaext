@@ -15,7 +15,7 @@ async function review(jobs, failSubmit = false, extra = {}) {
   w.chrome = { runtime: { connect: () => ({ onDisconnect: { addListener() {} }, disconnect() {} }), sendMessage: async msg => {
     messages.push(msg);
     if (msg.action === 'sc-list') return { ok: true, packages: [] };
-    if (msg.action === 'sc-get') return { ok: true, package: structuredClone(pack), sameStore: true };
+    if (msg.action === 'sc-get') return { ok: true, package: structuredClone(pack), sameStore: true, apiQueue: extra.apiQueue };
     if (msg.action === 'sc-diagnostics') return { ok: true, diagnostics: extra.diagnostics || { available: false, rowChoices: [], rows: [], ai: [], social: [] } };
     if (msg.action === 'ai-manual-preview') return { ok: true, rows: [{ index: 1, value: 'mail@example.test|manual_profile|SYNTHETIC_PASSWORD' },
       { index: 2, value: 'mail@example.test||SYNTHETIC_PASSWORD' }], digest: 'synthetic-digest', runId: 'synthetic-run', types: ['username'], platform: 'instagram' };
@@ -131,9 +131,20 @@ test('queued jobs are shown as queued rather than unconfirmed or sending', async
     requestAction: 'sc-submit', requestState: 'queued', attemptCount: 0 }]);
   try {
     const row = s.w.document.querySelector('tbody tr');
-    assert.match(row.textContent, /В очереди отправки · лимит 5 запросов\/с/);
+    assert.match(row.textContent, /В очереди отправки · общий лимит 3 запроса\/с/);
     assert.doesNotMatch(row.textContent, /Отправка не подтверждена|Ожидание ответа/);
     assert.equal(row.querySelector('.pm-request-retry'), null);
+  } finally { s.dom.window.close(); }
+});
+test('global server cooldown is visible for queued POST and GET without issuing extra HTTP', async () => {
+  const s = await review([
+    { query: job('pending').query, key: 'post', requestAction: 'sc-submit', requestState: 'queued' },
+    { ...job('pending'), key: 'get', requestAction: 'sc-refresh', requestState: 'queued' },
+  ], false, { apiQueue: { resumeAt: Date.now() + 60000, reason: 'rate_limit' } });
+  try {
+    assert.match(s.w.document.getElementById('summary').textContent, /HTTP 429: пауза сервера: ещё \d+ с; продолжение автоматическое/);
+    assert.match(s.w.document.querySelectorAll('tbody tr')[1].textContent, /В очереди получения результата · общий лимит 3 запроса\/с/);
+    assert.equal(s.messages.some(m => ['sc-submit', 'sc-refresh'].includes(m.action)), false);
   } finally { s.dom.window.close(); }
 });
 test('table progress redraws during a slow batch instead of waiting for every request to finish', async () => {

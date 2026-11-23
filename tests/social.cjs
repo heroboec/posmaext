@@ -318,7 +318,7 @@ test('check retries: changing store settings during a delay prevents sending to 
   w.advance(timers[0].ms); timers[0].fn();
   assert.equal((await request).ok, false); assert.equal(attempts, 1);
 });
-test('API starts checks 200 ms apart without waiting for responses and merges reverse results without losing siblings', async () => {
+test('API starts checks 350 ms apart without waiting for responses and merges reverse results without losing siblings', async () => {
   const w = worker(); await w.setup(); const id = await w.create();
   const pending = [];
   w.context.fetch = (url, options) => new Promise(resolve => pending.push({ resolve, options, at: w.context.Date.now() }));
@@ -326,7 +326,7 @@ test('API starts checks 200 ms apart without waiting for responses and merges re
   const second = w.send({ action: 'sc-submit', id, bidId: '42', job: 1, client: 'client' });
   for (let i = 0; i < 100 && pending.length < 2; i++) await settle();
   assert.equal(pending.length, 2, 'Both HTTP requests must start while neither response has arrived');
-  assert.equal(pending[1].at - pending[0].at, 200, 'At most five starts per second, responses may remain concurrent');
+  assert.equal(pending[1].at - pending[0].at, 350, 'Shared three requests/s cap, responses may remain concurrent');
   const duplicate = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
   await settle(); assert.equal(pending.length, 2, 'Concurrent duplicate must share the existing request');
   assert.equal((await w.send({ action: 'sc-sync', id })).ok, true);
@@ -338,8 +338,9 @@ test('API starts checks 200 ms apart without waiting for responses and merges re
   assert.deepEqual(pack.entries[0].jobs.map(j => j.check.id), ['check-0', 'check-1']);
   assert.equal(pack.entries[0].sourceStatus, '2');
 });
-test('one FIFO rate limit covers mixed POST, GET and catalog requests: never more than five starts per second', async () => {
+test('one FIFO rate limit covers mixed POST, GET and catalog requests: never more than three starts per second', async () => {
   const w = worker(); await w.setup();
+  const firstId = await w.create(), secondId = await w.create();
   const starts = [];
   w.context.fetch = async (url, options) => {
     starts.push({ at: w.context.Date.now(), method: options.method, url });
@@ -347,11 +348,13 @@ test('one FIFO rate limit covers mixed POST, GET and catalog requests: never mor
   };
   const calls = Array.from({ length: 18 }, (_, i) => w.context.api.scApi(
     i % 3 === 0 ? 'checks' : i % 3 === 1 ? 'checks/synthetic-check' : 'platforms',
-    i % 3 === 0 ? { method: 'POST', key: 'synthetic-' + i, query: { platform: 'facebook', identifier_type: 'id', identifier: String(100 + i) } } : {}));
+    { owner: (i % 2 ? firstId : secondId) + ':client',
+      ...(i % 3 === 0 ? { method: 'POST', key: 'synthetic-' + i,
+        query: { platform: 'facebook', identifier_type: 'id', identifier: String(100 + i) } } : {}) }));
   await Promise.all(calls);
   assert.equal(starts.length, 18);
-  for (let i = 1; i < starts.length; i++) assert.ok(starts[i].at - starts[i - 1].at >= 200);
-  for (let i = 5; i < starts.length; i++) assert.ok(starts[i].at - starts[i - 5].at >= 1000);
+  for (let i = 1; i < starts.length; i++) assert.ok(starts[i].at - starts[i - 1].at >= 350);
+  for (let i = 3; i < starts.length; i++) assert.ok(starts[i].at - starts[i - 3].at >= 1050);
   assert.deepEqual(starts.map(r => r.method), Array.from({ length: 18 }, (_, i) => i % 3 === 0 ? 'POST' : 'GET'));
 });
 test('rate limiter persists its next slot across worker restart', async () => {
@@ -359,7 +362,66 @@ test('rate limiter persists its next slot across worker restart', async () => {
   const first = w.requests[0].at;
   const restored = worker(w.indexedDB);
   await restored.context.api.scApi('platforms');
-  assert.ok(restored.requests[0].at - first >= 200);
+  assert.ok(restored.requests[0].at - first >= 350);
+});
+test('sustained mixed traffic respects both sliding windows with scheduling margin', async () => {
+  const w = worker(); await w.setup();
+  await Promise.all(Array.from({ length: 620 }, (_, i) => w.context.api.scApi(i % 2 ? 'checks/synthetic' : 'platforms')));
+  const starts = w.requests.map(r => r.at);
+  assert.equal(starts.length, 620);
+  for (let i = 3; i < starts.length; i++) assert.ok(starts[i] - starts[i - 3] >= 1050);
+  for (let i = 300; i < starts.length; i++) assert.ok(starts[i] - starts[i - 300] >= 60000);
+  const rate = await w.context.api.db.get('api-rate');
+  assert.ok(rate.starts.length <= 300);
+  assert.deepEqual(Object.keys(rate).sort(), ['next', 'starts']);
+});
+test('rolling minute admission survives restart even if previous starts were faster', async () => {
+  const w = worker(); await w.setup();
+  const now = w.context.Date.now();
+  await w.context.api.db.set('api-rate', { next: now, starts: Array.from({ length: 300 }, (_, i) => now - 10000 + i) });
+  const restored = worker(w.indexedDB);
+  await restored.context.api.scApi('platforms');
+  assert.ok(restored.requests[0].at >= now + 50000, 'Must not reset the minute counter on worker restart');
+});
+test('automatic polling waits ten seconds per accepted job, including across restart; manual GET remains available', async () => {
+  const w = worker(); await w.setup(); const id = await w.create();
+  await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  const job = (await w.send({ action: 'sc-get', id })).package.entries[0].jobs[0];
+  assert.equal(job.nextPollAt, w.context.Date.now() + 10000);
+  const restored = worker(w.indexedDB); restored.connect(id);
+  assert.equal(restored.context.api.common.autoAction(job), null);
+  assert.equal((await restored.send({ action: 'sc-refresh', id, bidId: '42', job: 0, client: 'client', manual: false })).ok, true);
+  assert.equal(restored.requests.length, 0);
+  restored.advance(10000);
+  assert.equal(restored.context.api.common.autoAction(job), 'sc-refresh');
+  assert.equal((await restored.send({ action: 'sc-refresh', id, bidId: '42', job: 0, client: 'client', manual: false })).ok, true);
+  assert.equal(restored.requests.length, 1);
+  assert.equal((await restored.send({ action: 'sc-refresh', id, bidId: '42', job: 0, client: 'client' })).ok, true);
+  assert.equal(restored.requests.length, 2);
+});
+test('429 without Retry-After pauses for one minute, exposes countdown, then resumes the same POST', async () => {
+  const w = worker(); await w.setup(); const id = await w.create(), starts = [], timers = [];
+  w.context.setTimeout = (fn, ms) => { if (ms > 0) timers.push({ fn, ms }); else queueMicrotask(fn); };
+  w.context.fetch = async (url, options) => {
+    starts.push({ at: w.context.Date.now(), options });
+    return starts.length === 1 ? { ok: false, status: 429, headers: new Headers() } :
+      { ok: true, status: 202, headers: new Headers(), json: async () => ({
+        id: 'synthetic-recovered', status: 'found', query: JSON.parse(options.body),
+      }) };
+  };
+  const request = w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
+  for (let i = 0; i < 100 && !timers.length; i++) await settle();
+  const result = await w.send({ action: 'sc-get', id });
+  assert.equal(result.apiQueue.reason, 'rate_limit');
+  assert.equal(result.apiQueue.resumeAt - w.context.Date.now(), 60000);
+  assert.equal(result.package.entries[0].jobs[0].requestState, 'retry_wait');
+  assert.equal(starts.length, 1);
+  const timer = timers.shift(); w.advance(timer.ms); timer.fn();
+  assert.equal((await request).ok, true);
+  assert.equal(starts.length, 2);
+  assert.ok(starts[1].at - starts[0].at >= 60000);
+  assert.equal(starts[0].options.body, starts[1].options.body);
+  assert.equal(starts[0].options.headers['Idempotency-Key'], starts[1].options.headers['Idempotency-Key']);
 });
 test('a queued job has not spent an attempt and closing its page cancels it before HTTP', async () => {
   const w = worker(); await w.setup(); const id = await w.create(), pending = [], timers = [];

@@ -2,7 +2,9 @@
 
 // Pure helpers shared by the isolated content script, worker and review page.
 const PM_SOCIAL = (() => {
-  const retryLimit = 10, aiRetryLimit = 3, retryDelay = 2000, apiInterval = 200;
+  // One shared 3/s budget, with a small margin for network/server scheduling jitter.
+  const retryLimit = 10, aiRetryLimit = 3, retryDelay = 2000, apiInterval = 350;
+  const apiMinuteLimit = 300, apiMinuteWindow = 60000, pollInterval = 10000;
   const defaults = { Instagram: 'instagram', Twitter: 'x', X: 'x', 'x.com(Twitter)': 'x',
     TikTok: 'tiktok', YouTube: 'youtube', Reddit: 'reddit', Facebook: 'facebook' };
   const supported = { instagram: ['username'], facebook: ['username', 'id'], x: ['username'],
@@ -129,6 +131,7 @@ const PM_SOCIAL = (() => {
     if (job.requestAction === action && ['failed', 'paused'].includes(job.requestState)) return null;
     const resuming = job.requestAction === action && ['queued', 'sending', 'retry_wait'].includes(job.requestState);
     if (resuming) return resumeAttempts(job, action) < retryLimit + 1 ? action : null;
+    if (action === 'sc-refresh' && job.nextPollAt > Date.now()) return null;
     if (job.error && !legacyTransient(job)) return null;
     if (job.error && (job.retryCount || 0) >= retryLimit) return null;
     if (resumeAttempts(job, action) >= retryLimit + 1) return null;
@@ -137,5 +140,5 @@ const PM_SOCIAL = (() => {
   }
   return { defaults, fields, statuses, normalize, valid, rows, sample, types, serverSuccess, manualColumn,
     profileURL, resolve, splitColumns, autoAction, resumeAttempts,
-    retryLimit, aiRetryLimit, retryDelay, apiInterval };
+    retryLimit, aiRetryLimit, retryDelay, apiInterval, apiMinuteLimit, apiMinuteWindow, pollInterval };
 })();
