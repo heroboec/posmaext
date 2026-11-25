@@ -7,6 +7,12 @@ let scStartSerial = Promise.resolve();
 let scNextStart = 0;
 const scBootTime = Date.now();
 const scInFlight = new Map();
+// Local, secret-free progress for the settings connection test. Reading this
+// must not wait behind the very queue whose state we are trying to diagnose.
+let scConnectionTest = null;
+function scConnectionProgress(stage, waitUntil = 0) {
+  scConnectionTest = { stage, waitUntil, startedAt: scConnectionTest?.startedAt || Date.now(), updatedAt: Date.now() };
+}
 function scExclusive(fn) {
   const task = scSerial.then(fn);
   scSerial = task.catch(() => {});
@@ -63,24 +69,30 @@ function scRecovered() {
   scLimitSerial = task.catch(() => {});
   return task;
 }
-async function scApi(path, { method = 'GET', query, key, owner, binding, preflight, diagnostic, onStart } = {}) {
+async function scApi(path, { method = 'GET', query, key, owner, binding, preflight, diagnostic, onStart, progress } = {}) {
   // One FIFO admission queue for POST, GET, catalog calls and retries across tabs.
   // Release the slot after starting fetch(), never after receiving its response.
+  progress?.('queue');
   const start = scStartSerial.then(async () => {
     let config;
     for (;;) {
       await scLimitSerial;
       const limit = await PM_DB.get('api-limit'), rate = await PM_DB.get('api-rate');
       const next = Math.max(limit?.next || 0, scRateNext(rate));
-      if (next > Date.now()) await scSleep(next - Date.now());
+      if (next > Date.now()) {
+        progress?.(limit?.next > Date.now() ? 'cooldown' : 'rate', next);
+        await scSleep(next - Date.now());
+      }
       scAssertLive(owner);
       if (next > Date.now()) continue;
       await scLimitSerial;
       if ((await PM_DB.get('api-limit'))?.next > Date.now()) continue;
       scAssertLive(owner);
+      progress?.('config');
       config = await scConfig();
       if (binding && binding !== await scBinding(config)) throw new Error('URL или ключ магазина изменились. Для этого пакета API заблокирован');
       if (!config.key) throw new Error('Укажите API-ключ в настройках');
+      progress?.('permission');
       if (!await chrome.permissions.contains({ origins: [new URL(config.url).origin + '/*'] })) throw new Error('Нет разрешения на доступ к серверу. Сохраните настройки Social Check');
       await preflight?.();
       await scLimitSerial;
@@ -103,6 +115,7 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
     }
     let outcome;
     try {
+      progress?.('response');
       outcome = Promise.resolve(fetch(new URL('api/v1/' + path, config.url).href, {
         method, credentials: 'omit', redirect: 'error', cache: 'no-store',
         headers: { Authorization: 'Bearer ' + config.key, ...(query ? { 'Content-Type': 'application/json', 'Idempotency-Key': key } : {}) },
@@ -147,6 +160,7 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
   }
   await scRecovered();
   let json;
+  progress?.('json');
   try { json = captured ? captured.json() : await response.json(); } catch (err) {
     PM_DIAG.error(trace, err);
     await scBackoff();
@@ -226,11 +240,12 @@ async function scHandle(msg, sender) {
   }
   if (msg.action === 'sc-test') {
     if (!scPage(sender, 'options.html')) throw new Error('Доступ запрещён');
+    scConnectionProgress('config');
     const binding = await scBinding(await scConfig());
     // Network admission may need scExclusive for another job's onStart progress.
     // Never hold the state lock while waiting in the shared HTTP queue.
     return async () => {
-      const result = await scApi('platforms', { binding });
+      const result = await scApi('platforms', { binding, progress: scConnectionProgress });
       if (!Array.isArray(result.platforms)) throw new Error('Неверный ответ каталога API');
       return scExclusive(async () => {
         if (binding !== await scBinding(await scConfig())) throw new Error('Настройки Social Check изменились во время проверки связи');
@@ -453,7 +468,24 @@ chrome.runtime.onConnect.addListener(port => {
 });
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (!msg?.action?.startsWith('sc-') || msg.action === 'sc-source') return;
+  if (msg.action === 'sc-test-status') {
+    if (!scPage(sender, 'options.html')) respond({ ok: false, error: 'Доступ запрещён' });
+    else respond({ ok: true, test: scConnectionTest });
+    return;
+  }
+  const connectionTest = msg.action === 'sc-test' && scPage(sender, 'options.html');
+  if (connectionTest) {
+    scConnectionTest = null;
+    scConnectionProgress('state');
+  }
   const task = scExclusive(() => scHandle(msg, sender)).then(result => typeof result === 'function' ? result() : result);
-  task.then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
+  task.then(result => {
+    if (connectionTest) scConnectionProgress('done');
+    respond({ ok: true, ...result });
+  }, error => {
+    const stage = connectionTest ? scConnectionTest?.stage : null;
+    if (connectionTest) scConnectionProgress('failed');
+    respond({ ok: false, error: error.message, ...(connectionTest ? { stage } : {}) });
+  });
   return true;
 });

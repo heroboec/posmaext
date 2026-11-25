@@ -471,6 +471,63 @@ test('checking the catalog does not hold the state lock and deadlock queued job 
     json: async () => ({ id: 'synthetic-' + i, status: 'pending', query: JSON.parse(p.options.body) }) });
   await Promise.all([a, b, connection]);
 });
+test('connection progress remains readable during a persisted cooldown after restart, without HTTP or secrets', async () => {
+  const first = worker(); await first.setup();
+  const next = first.context.Date.now() + 60000;
+  await first.context.api.db.set('api-limit', { next, failures: 1, reason: 'rate_limit' });
+  const w = worker(first.indexedDB), timers = [];
+  w.context.setTimeout = (fn, ms) => timers.push({ fn, ms });
+  w.context.fetch = async () => {
+    w.requests.push({ at: w.context.Date.now() });
+    return { ok: true, status: 200, headers: new Headers(), json: async () => ({ platforms: catalog }) };
+  };
+  const request = w.send({ action: 'sc-test' }, optionsSender);
+  for (let i = 0; i < 100 && !timers.length; i++) await settle();
+  const status = await w.send({ action: 'sc-test-status' }, optionsSender);
+  assert.equal(status.ok, true);
+  assert.equal(status.test.stage, 'cooldown');
+  assert.equal(status.test.waitUntil, next);
+  assert.equal(w.requests.length, 0);
+  assert.equal(JSON.stringify(status).includes('SYNTHETIC_API_KEY'), false);
+  assert.equal(JSON.stringify(status).includes('api.example.test'), false);
+  assert.equal((await w.send({ action: 'sc-test-status' }, contentSender)).ok, false);
+  assert.equal((await w.send({ action: 'sc-test-status' }, reviewSender)).ok, false);
+  const timer = timers.shift(); w.advance(timer.ms); timer.fn();
+  assert.equal((await request).ok, true);
+  assert.equal(w.requests.length, 1);
+  assert.equal((await w.send({ action: 'sc-test-status' }, optionsSender)).test.stage, 'done');
+});
+test('connection failure reports the HTTP stage even when the exception is caught and the console is silent', async () => {
+  const w = worker(); await w.setup(); let rejectFetch;
+  w.context.fetch = () => new Promise((resolve, reject) => { rejectFetch = reject; });
+  const request = w.send({ action: 'sc-test' }, optionsSender);
+  for (let i = 0; i < 100 && !rejectFetch; i++) await settle();
+  assert.equal((await w.send({ action: 'sc-test-status' }, optionsSender)).test.stage, 'response');
+  rejectFetch(Object.assign(new Error('Synthetic timeout'), { name: 'TimeoutError' }));
+  const result = await request;
+  assert.equal(result.ok, false);
+  assert.equal(result.stage, 'response');
+  assert.match(result.error, /Нет ответа/);
+  assert.equal((await w.send({ action: 'sc-test-status' }, optionsSender)).test.stage, 'failed');
+});
+test('connection status bypasses the state lock while a test is still waiting to start', async () => {
+  const w = worker(); await w.setup(); let release;
+  const get = w.context.api.db.get; let blocked = false;
+  w.context.api.db.get = async key => {
+    if (blocked) return get(key);
+    blocked = true;
+    return new Promise(resolve => { release = resolve; });
+  };
+  const request = w.send({ action: 'sc-test' }, optionsSender);
+  for (let i = 0; i < 100 && !release; i++) await settle();
+  const result = await w.send({ action: 'sc-test-status' }, optionsSender);
+  assert.equal(result.ok, true);
+  assert.equal(result.test.stage, 'config');
+  assert.equal(w.requests.length, 0);
+  // Complete the blocked config read with no key; no HTTP will be sent.
+  release(undefined);
+  assert.equal((await request).ok, false);
+});
 test('a catalog response from the previous store is discarded if settings change during its request', async () => {
   const w = worker(); await w.setup(); let release;
   w.context.fetch = () => new Promise(resolve => { release = () => resolve({ ok: true, status: 200, headers: new Headers(),

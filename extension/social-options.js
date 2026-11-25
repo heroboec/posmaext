@@ -3,8 +3,23 @@
 const scOption = id => document.getElementById('social-' + id);
 async function scOptionsMessage(message) {
   const result = await chrome.runtime.sendMessage(message);
-  if (!result?.ok) throw new Error(result?.error || 'Нет связи с расширением');
+  if (!result?.ok) throw Object.assign(new Error(result?.error || 'Нет связи с расширением'), { stage: result?.stage });
   return result;
+}
+const scTestStages = {
+  state: 'Ожидание фонового обработчика',
+  queue: 'Ожидание общей очереди API; запрос ещё не отправлен',
+  cooldown: 'Сохранённая пауза после ошибки API; запрос ещё не отправлен',
+  rate: 'Ожидание лимита частоты API; запрос ещё не отправлен',
+  config: 'Чтение сохранённых настроек',
+  permission: 'Проверка разрешения на адрес API',
+  response: 'Запрос отправлен; ожидание ответа API (таймаут 30 с)',
+  json: 'Чтение и разбор ответа API',
+};
+function scTestProgressText(test) {
+  if (!test || !scTestStages[test.stage]) return null;
+  const seconds = Math.max(0, Math.ceil(((test.waitUntil || 0) - Date.now()) / 1000));
+  return `${scTestStages[test.stage]}${seconds ? ` · ещё ${seconds} с` : ''}`;
 }
 async function scOptionsLoad() {
   const config = await scOptionsMessage({ action: 'sc-config-get' });
@@ -37,10 +52,29 @@ scOption('save').onclick = async () => {
 scOption('test').onclick = async () => {
   scOption('test').disabled = true;
   scOption('status').textContent = 'Проверяю…';
+  let finished = false, polling = false, lastStatusAt = Date.now();
+  const poll = setInterval(async () => {
+    if (!finished && Date.now() - lastStatusAt > 5000) {
+      scOption('status').textContent = 'Фоновый обработчик не сообщает этап проверки более 5 с. Проверьте ошибки Position Matcher на chrome://extensions.';
+    }
+    if (polling) return;
+    polling = true;
+    try {
+      const result = await scOptionsMessage({ action: 'sc-test-status' });
+      lastStatusAt = Date.now();
+      const text = scTestProgressText(result.test);
+      if (!finished && text) scOption('status').textContent = text;
+    } catch (_) {
+      if (!finished) scOption('status').textContent = 'Нет связи с фоновым обработчиком расширения. Откройте chrome://extensions и проверьте ошибки Position Matcher.';
+    } finally { polling = false; }
+  }, 1000);
   try {
     const result = await scOptionsMessage({ action: 'sc-test' });
     scOption('status').textContent = result.catalog.length ? `Связь есть. Каталог: ${result.catalog.map(p => `${p.platform} (${p.identifier_types.join(', ')})`).join('; ')}` : 'Связь есть, но все платформы отключены.';
-  } catch (e) { scOption('status').textContent = e.message; }
-  finally { scOption('test').disabled = false; }
+  } catch (e) {
+    scOption('status').textContent = `${e.message}${scTestStages[e.stage] ? ` · Этап: ${scTestStages[e.stage]}` : ''}`;
+  } finally {
+    finished = true; clearInterval(poll); scOption('test').disabled = false;
+  }
 };
 scOptionsLoad().catch(e => { scOption('status').textContent = e.message; });
