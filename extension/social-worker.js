@@ -54,6 +54,19 @@ function scRateStarts(rate) {
   return (Array.isArray(rate?.starts) ? rate.starts : [])
     .filter(at => Number.isFinite(at) && at > Date.now() - PM_SOCIAL.apiMinuteWindow);
 }
+function scRepairRateClock(rate) {
+  if (!rate) return rate;
+  const starts = (Array.isArray(rate.starts) ? rate.starts : []).filter(Number.isFinite);
+  // `next` is written only as dispatch time + apiInterval, never Retry-After.
+  // Future dispatches therefore mean that the wall clock has moved backwards.
+  const last = Math.max(Number.isFinite(rate.next) ? rate.next - PM_SOCIAL.apiInterval : 0, ...starts);
+  const now = Date.now();
+  if (last <= now) return rate;
+  const shift = now - last;
+  // Rebase, don't clear the minute history: keep the same relative ages and
+  // conservatively count the latest previous dispatch as happening right now.
+  return { ...rate, next: now + PM_SOCIAL.apiInterval, starts: starts.map(at => at + shift) };
+}
 function scRateNext(rate) {
   const starts = scRateStarts(rate);
   return Math.max(rate?.next || 0, scNextStart,
@@ -77,7 +90,9 @@ async function scApi(path, { method = 'GET', query, key, owner, binding, preflig
     let config;
     for (;;) {
       await scLimitSerial;
-      const limit = await PM_DB.get('api-limit'), rate = await PM_DB.get('api-rate');
+      const limit = await PM_DB.get('api-limit'), savedRate = await PM_DB.get('api-rate');
+      const rate = scRepairRateClock(savedRate);
+      if (rate !== savedRate) await PM_DB.set('api-rate', rate);
       const next = Math.max(limit?.next || 0, scRateNext(rate));
       if (next > Date.now()) {
         progress?.(limit?.next > Date.now() ? 'cooldown' : 'rate', next);
@@ -301,7 +316,7 @@ async function scHandle(msg, sender) {
     if (changed) await scSave(pack);
     const limit = await PM_DB.get('api-limit'), rate = await PM_DB.get('api-rate');
     return { package: pack, sameStore: pack.binding === await scBinding(await scConfig()),
-      apiQueue: { resumeAt: Math.max(limit?.next || 0, scRateNext(rate)),
+      apiQueue: { resumeAt: Math.max(limit?.next || 0, scRateNext(scRepairRateClock(rate))),
         reason: limit?.next > Date.now() ? limit.reason || 'temporary' : 'rate',
         active: scInFlight.size } };
   }

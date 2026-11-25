@@ -383,6 +383,38 @@ test('rolling minute admission survives restart even if previous starts were fas
   await restored.context.api.scApi('platforms');
   assert.ok(restored.requests[0].at >= now + 50000, 'Must not reset the minute counter on worker restart');
 });
+test('clock rollback after reboot rebases the saved rate slot instead of waiting twenty minutes', async () => {
+  const w = worker(); await w.setup();
+  w.advance(1200000);
+  await w.context.api.scApi('platforms');
+  const restored = worker(w.indexedDB), now = restored.context.Date.now();
+  await restored.context.api.scApi('platforms');
+  assert.equal(restored.requests.length, 1);
+  assert.equal(restored.requests[0].at - now, 350);
+  const rate = await restored.context.api.db.get('api-rate');
+  assert.deepEqual(plain(rate.starts), [now, now + 350], 'Previous dispatch must remain in the minute budget');
+});
+test('clock rollback retains a full minute budget and server cooldown, not the future wall-clock slot', async () => {
+  const w = worker(); await w.setup();
+  const now = w.context.Date.now(), future = now + 1200000;
+  await w.context.api.db.set('api-rate', { next: future + 350,
+    starts: Array.from({ length: 300 }, (_, i) => future - 10000 + i * 10000 / 299) });
+  // A real server cooldown may be longer than a minute; it must not be erased.
+  const limit = { next: now + 90000, failures: 1, reason: 'rate_limit' };
+  await w.context.api.db.set('api-limit', limit);
+  const restored = worker(w.indexedDB);
+  await restored.context.api.scApi('platforms');
+  assert.equal(restored.requests[0].at - now, 90000);
+  assert.equal((await restored.context.api.db.get('api-limit')).next, limit.next);
+});
+test('clock rollback without server cooldown still respects all 300 previous dispatches', async () => {
+  const w = worker(); await w.setup();
+  const now = w.context.Date.now(), future = now + 1200000;
+  await w.context.api.db.set('api-rate', { next: future + 350, starts: Array(300).fill(future) });
+  const restored = worker(w.indexedDB);
+  await restored.context.api.scApi('platforms');
+  assert.equal(restored.requests[0].at - now, 60000);
+});
 test('automatic polling waits ten seconds per accepted job, including across restart; manual GET remains available', async () => {
   const w = worker(); await w.setup(); const id = await w.create();
   await w.send({ action: 'sc-submit', id, bidId: '42', job: 0, client: 'client' });
